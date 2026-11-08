@@ -1,0 +1,6 @@
+{
+  "manifestVersion": 1,
+  "id": "broker-proxy",
+  "version": "0.1.0",
+  "entry": "build/extension.mjs"
+}
