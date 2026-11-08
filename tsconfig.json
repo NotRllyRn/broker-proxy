@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noUncheckedIndexedAccess": true, "outDir": "build", "rootDir": "src",
+    "types": ["node"], "skipLibCheck": false, "declaration": false
+  },
+  "include": ["src/**/*.mts"]
+}

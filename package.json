@@ -1,0 +1,14 @@
+{
+  "name": "broker-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:system": "npm run build && node --test test/system.test.mjs",
+    "demo": "node scripts/demo.mjs"
+  },
+  "devDependencies": { "@types/node": "24.10.0", "typescript": "5.9.3" }
+}
