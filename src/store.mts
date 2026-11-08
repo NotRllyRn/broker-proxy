@@ -1,7 +1,9 @@
 import { mkdir, readFile, open, rename, unlink, chmod, lstat, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { emptyState, Fault, object, credential, labels, text, type State } from './model.mjs';
 
+export const STATE_LIMIT = 32 * 1024 * 1024;
 function validate(value: unknown): State {
   const s = object(value);
   if (s.version !== 1 || !Array.isArray(s.accounts) || !Array.isArray(s.callers) || !Array.isArray(s.exclusions) || !Array.isArray(s.history)
@@ -10,6 +12,8 @@ function validate(value: unknown): State {
   const ids = new Set<string>();
   for (const a of state.accounts) {
     text(a.id); text(a.label); labels(a.labels);
+    a.generation ??= randomUUID(); // Additive migration of the initial version-1 format.
+    text(a.generation);
     if (ids.has(a.id) || typeof a.enabled !== 'boolean' || !['verified', 'refreshing', 'required'].includes(a.authState)
       || !Number.isFinite(a.createdAt) || !a.credential || typeof a.identity !== 'string') throw new Fault('INVALID_STATE');
     ids.add(a.id);
@@ -57,7 +61,7 @@ export class Store {
       try {
         const path = join(dir, 'state.json');
         const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink() || info.size > 32 * 1024 * 1024) throw new Fault('INVALID_STATE');
+        if (!info.isFile() || info.isSymbolicLink() || info.size > STATE_LIMIT) throw new Fault('INVALID_STATE');
         await chmod(path, 0o600);
         store.state = validate(JSON.parse(await readFile(path, 'utf8')));
       } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Fault('INVALID_STATE'); }
@@ -75,10 +79,12 @@ export class Store {
     const run = this.tail.then(async () => {
       if (this.poisoned || this.closed) throw new Fault('STORE_UNAVAILABLE');
       const next = structuredClone(this.state), result = fn(next);
+      const serialized = JSON.stringify(next);
+      if (Buffer.byteLength(serialized) > STATE_LIMIT) throw new Fault('STATE_TOO_LARGE', 409);
       const path = join(this.dir, 'state.next');
       try {
         const file = await open(path, 'w', 0o600);
-        try { await file.writeFile(JSON.stringify(next)); await file.sync(); } finally { await file.close(); }
+        try { await file.writeFile(serialized); await file.sync(); } finally { await file.close(); }
         await rename(path, join(this.dir, 'state.json'));
         const directory = await open(this.dir, 'r');
         try { await directory.sync(); } finally { await directory.close(); }

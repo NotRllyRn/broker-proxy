@@ -35,7 +35,10 @@ const setup = async (api) => {
     api.on({ id: 'authenticate', stage: 'request', bodyMode: 'none', order: -1000, failure: 'block' }, input => {
         try {
             const c = broker.authenticate(bearer(input));
-            if (header(input.request.header, 'trailer').length)
+            // Older hosts cannot expose native trailers: fail closed rather than pretend header stripping is enough.
+            if (input.requestHasTrailers === undefined)
+                throw new Fault('HOST_UPGRADE_REQUIRED', 503);
+            if (input.requestHasTrailers || header(input.request.header, 'trailer').length)
                 throw new Fault('TRAILERS_UNSUPPORTED', 400);
             const preferred = header(input.request.header, 'x-broker-preferred-account')[0] ?? '';
             return { action: 'replace', message: { ...input.request, header: safeHeaders(input.request.header) }, metadata: { caller: c.id, preferred } };
@@ -54,7 +57,7 @@ const setup = async (api) => {
             const a = await broker.select(input.metadata.caller, input.metadata.preferred ?? '', input.identity.exchange, input.identity.attempt, context.signal);
             const url = config.upstream + path + new URL(input.request.url).search;
             return { action: 'replace', message: { ...input.request, url, header: safeHeaders(input.request.header) },
-                metadata: { ...input.metadata, account: a.id },
+                metadata: { ...input.metadata, account: a.id, generation: a.generation },
                 credentials: { Authorization: [`Bearer ${a.credential.accessToken}`], 'Chatgpt-Account-Id': [a.credential.accountId] } };
         }
         catch (e) {
@@ -63,11 +66,11 @@ const setup = async (api) => {
     });
     api.on({ id: 'account-outcome', stage: 'observe', bodyMode: 'none', failure: 'block' }, async (input) => {
         if (input.metadata.account && input.metadata.caller)
-            await broker.observe(input.metadata.account, input.metadata.caller, input.response.status);
+            await broker.observe(input.metadata.account, input.metadata.caller, input.response.status, input.metadata.generation);
         return { action: 'pass' };
     });
     // Opt-in buffered safe-method fallback. Authentication is explicit again, not host auth inheritance.
-    api.on({ id: 'safe-fallback', stage: 'responseStart', bodyMode: 'none', failure: 'block' }, async (input, context) => {
+    api.on({ id: 'safe-fallback', stage: 'responseStart', bodyMode: 'none', failure: 'block' }, async (input) => {
         const safe = (method) => ['GET', 'HEAD', 'OPTIONS'].includes(method);
         if (!config.safeFallback || input.identity.depth !== 0 || !input.metadata.account || input.response.status < 500
             || !safe(input.requested.method) || !safe(input.request.method)

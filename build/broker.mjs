@@ -51,6 +51,7 @@ export class Broker {
         await this.store.change(s => {
             const a = s.accounts.find(a => a.id === existing.id);
             a.credential = c;
+            a.generation = randomUUID();
             a.authState = 'verified';
             a.lastError = null;
             a.label = text(label);
@@ -59,15 +60,18 @@ export class Broker {
         });
         return existing.id;
     }
-    async activate(label, accountLabels, c, identity, usage, startedAt = this.clock()) {
+    async activate(label, accountLabels, c, identity, usage, startedAt = this.clock(), signal) {
         const id = randomUUID(), now = this.clock();
         await this.store.change(s => {
+            // Cancellation wins while queued; beginning this transaction is the activation commit boundary.
+            if (signal?.aborted)
+                throw new Fault('CANCELLED', 499);
             if (s.accounts.length >= 1000)
                 throw new Fault('ACCOUNT_LIMIT', 409);
             if (s.accounts.some(a => a.credential.accountId === c.accountId || identity && a.identity === identity))
                 throw new Fault('DUPLICATE_ACCOUNT', 409);
             s.accounts.push({ id, label, labels: accountLabels, enabled: true, authState: 'verified', createdAt: now,
-                credential: c, identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null });
+                credential: c, generation: randomUUID(), identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null });
         });
         return id;
     }
@@ -76,7 +80,8 @@ export class Broker {
             const a = s.accounts.find(a => a.id === id);
             if (!a)
                 throw new Fault('NOT_FOUND', 404);
-            a.enabled = enabled;
+            if (enabled !== undefined)
+                a.enabled = enabled;
             if (accountLabels)
                 a.labels = labels(accountLabels);
         });
@@ -108,16 +113,22 @@ export class Broker {
                 if (!a || a.credential.accessToken !== original.accessToken)
                     throw new Fault('ACCOUNT_CHANGED', 409);
                 a.credential = result.credential;
+                a.generation = randomUUID();
                 a.authState = 'verified';
                 a.lastError = null;
                 applyQuota(a, normalizeUsage(result.usage, startedAt, this.clock()));
             });
         }
         catch (e) {
-            await this.store.change(s => { const a = s.accounts.find(a => a.id === id); if (a) {
-                a.authState = 'required';
-                a.lastError = 'REFRESH_FAILED';
-            } });
+            await this.store.change(s => {
+                const a = s.accounts.find(a => a.id === id);
+                if (!a || a.credential.accessToken !== original.accessToken || a.authState !== 'refreshing')
+                    return;
+                // Admission rejection cannot have rotated credentials; ambiguous provider failures can.
+                const busy = e instanceof Fault && e.code === 'PROVIDER_BUSY';
+                a.authState = busy ? 'verified' : 'required';
+                a.lastError = busy ? 'PROVIDER_BUSY' : 'REFRESH_FAILED';
+            });
             throw e instanceof Fault ? e : new Fault('REFRESH_FAILED');
         }
     }
@@ -146,7 +157,7 @@ export class Broker {
             return structuredClone(a);
         });
     }
-    async observe(account, caller, status) {
+    async observe(account, caller, status, generation) {
         await this.store.change(s => {
             const a = s.accounts.find(a => a.id === account);
             if (!a)
@@ -159,7 +170,7 @@ export class Broker {
                 a.blockedAt = this.clock();
                 a.lastError = 'QUOTA_OR_RATE_LIMIT';
             }
-            else if (status === 401 || status === 403) {
+            else if ((status === 401 || status === 403) && generation === a.generation) {
                 a.authState = 'required';
                 a.lastError = 'UPSTREAM_AUTH_REJECTED';
             }
@@ -193,7 +204,7 @@ export class Broker {
                     throw new Fault('CANCELLED');
                 view.state = 'verifying';
                 delete view.device;
-                await this.activate('Example user', this.enrollmentLabels, result.credential, result.identity, result.usage, now);
+                await this.activate('Example user', this.enrollmentLabels, result.credential, result.identity, result.usage, now, signal);
                 view.state = 'completed';
             }
             catch (e) {

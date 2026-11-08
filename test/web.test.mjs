@@ -52,8 +52,18 @@ test('two real HTTP services: admin auth, CSRF, enrollment ownership, activation
   const id = JSON.parse(status.text).accounts[0].id;
   assert.equal((await admin.request('/account/state', { id, enabled: 'false' })).status, 303);
   assert.equal(JSON.parse((await admin.request('/api/status')).text).accounts[0].enabled, false);
+  assert.equal((await admin.request('/account/labels', { id, enabled: 'true', labels: 'Updated label' })).status, 303);
+  const edited = JSON.parse((await admin.request('/api/status')).text).accounts[0];
+  assert.equal(edited.enabled, false); assert.deepEqual(edited.labels, ['Updated label']);
   assert.equal((await admin.request('/caller/add', { label: 'Work laptop', secret: 'fixture-caller-secret-01234567890123456789', allow: 'Personal usage', block: '' })).status, 303);
   assert.equal(broker.view().callers.length, 1);
+  for (const origin of [config.dashboard.origin, config.enrollment.origin]) {
+    for (let i = 0; i < 260; i++) {
+      const visit = await fetch(origin); assert.equal(visit.status, 200); await visit.text();
+    }
+  }
+  assert.equal((await admin.request('/api/status')).status, 200); // Authenticated session was not evicted.
+  assert.equal(JSON.parse((await publicBrowser.request('/status')).text).state, 'failed'); // Enrollment owner was retained.
 });
 test('public cancellation terminates runtime and restart invalidates enrollment sessions', async t => {
   const dir = await temp();

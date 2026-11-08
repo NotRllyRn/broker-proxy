@@ -139,7 +139,8 @@ export class CodexProvider {
         if (this.stopped || signal.aborted)
             throw new Fault('CANCELLED', 499);
         // Reserve before the first await to bound concurrent creation too.
-        if (this.reserved >= this.max)
+        // Public device logins leave one slot for credential refresh (when capacity permits).
+        if (this.reserved >= (saved ? this.max : Math.max(1, this.max - 1)))
             throw new Fault('PROVIDER_BUSY', 429);
         this.reserved++;
         let home, runtime, loginTimer;

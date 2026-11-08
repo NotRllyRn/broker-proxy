@@ -11,7 +11,7 @@ export type Quota = { short: Window; weekly: Window; observedAt: number; started
 export type Account = {
   id: string; label: string; labels: string[]; enabled: boolean;
   authState: 'verified' | 'refreshing' | 'required'; createdAt: number;
-  credential: Credential; identity: string; quota: Quota | null;
+  credential: Credential; generation: string; identity: string; quota: Quota | null;
   blockedAt: number | null; lastError: string | null;
 };
 export type Caller = { id: string; label: string; digest: string; enabled: boolean; allow: string[]; block: string[] };

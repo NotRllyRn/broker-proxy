@@ -31,7 +31,11 @@ class Site {
     const cookie = (req.headers.cookie ?? '').split(';').map(s => s.trim()).find(s => s.startsWith(name + '='))?.slice(name.length + 1);
     const old = cookie && this.sessions.get(cookie);
     if (old) return old;
-    if (this.sessions.size >= 256) throw new Fault('SESSION_LIMIT', 429);
+    if (this.sessions.size >= 256) {
+      const idle = [...this.sessions].find(([, s]) => !s.admin && !s.enrollment);
+      if (idle) this.sessions.delete(idle[0]);
+      else throw new Fault('SESSION_LIMIT', 429);
+    }
     const id = token(), s = { csrf: token(), expires: now + 3600000, admin: false };
     this.sessions.set(id, s);
     res.setHeader('Set-Cookie', `${name}=${id}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600${this.listener.origin.startsWith('https:') ? '; Secure' : ''}`);
@@ -70,7 +74,7 @@ class Site {
           case '/logout': session.admin = false; session.csrf = token(); break;
           case '/account/import': await this.broker.importAccount(get('label'), list(get('labels')), JSON.parse(get('auth'))); break;
           case '/account/state': await this.broker.setAccount(get('id'), get('enabled') === 'true'); break;
-          case '/account/labels': await this.broker.setAccount(get('id'), get('enabled') === 'true', list(get('labels'))); break;
+          case '/account/labels': await this.broker.setAccount(get('id'), undefined, list(get('labels'))); break;
           case '/account/refresh': await this.broker.refresh(get('id')); break;
           case '/caller/add': await this.broker.addCaller(get('label'), get('secret'), list(get('allow')), list(get('block'))); break;
           case '/caller/state': await this.broker.setCaller(get('id'), get('enabled') === 'true'); break;
@@ -92,7 +96,10 @@ class Site {
       if (enrollment) {
         content += `<p>Status: <strong>${esc(enrollment.state)}</strong></p>`;
         if (enrollment.device) content += `<p>Open <a href="${esc(enrollment.device.url)}" rel="noreferrer" target="_blank">the provider authorization page</a> and enter this code:</p><p><code>${esc(enrollment.device.code)}</code></p>`;
-        if (['starting', 'waiting', 'verifying'].includes(enrollment.state)) content += `<p><a href="/">Refresh status</a> (expires ${esc(new Date(enrollment.expires).toISOString())})</p>${form('/cancel', session.csrf, '<button>Cancel enrollment</button>')}`;
+        if (['starting', 'waiting', 'verifying'].includes(enrollment.state)) {
+          res.setHeader('Refresh', '3; url=/');
+          content += `<p>Status refreshes every three seconds. <a href="/">Refresh now</a> (expires ${esc(new Date(enrollment.expires).toISOString())})</p>${form('/cancel', session.csrf, '<button>Cancel enrollment</button>')}`;
+        }
         else content += `<p>${esc(enrollment.error ?? 'Enrollment complete. You may close this page.')}</p>`;
       }
       if (!enrollment || ['completed', 'failed', 'cancelled', 'expired'].includes(enrollment.state)) content += form('/start', session.csrf, '<button>Start device login</button>');
@@ -107,7 +114,7 @@ class Site {
     const v = this.broker.view();
     const quota = (a: typeof v.accounts[number]) => a.quota ? `${a.quota.short.used}% short / ${a.quota.weekly.used}% weekly; observed ${new Date(a.quota.observedAt).toISOString()}` : 'Unknown (not zero)';
     const action = (path: string, id: string, label: string, extra = '') => form(path, session.csrf, `<input type="hidden" name="id" value="${esc(id)}">${extra}<button>${label}</button>`);
-    const accounts = v.accounts.map(a => `<tr><td>${esc(a.label)}<small>${esc(a.labels.join(', '))}</small></td><td>${a.enabled ? 'Active' : 'Disabled'} / ${esc(a.authState)}${a.blocked ? ' / quota blocked' : ''}<small>${esc(a.lastError)}</small></td><td>${esc(quota(a))}</td><td>${action('/account/state', a.id, a.enabled ? 'Deactivate' : 'Activate', `<input type="hidden" name="enabled" value="${!a.enabled}">`)}${action('/account/refresh', a.id, 'Refresh')}${action('/account/labels', a.id, 'Save labels', `<input type="hidden" name="enabled" value="${a.enabled}"><label>Labels <input name="labels" value="${esc(a.labels.join(', '))}"></label>`)}</td></tr>`).join('');
+    const accounts = v.accounts.map(a => `<tr><td>${esc(a.label)}<small>${esc(a.labels.join(', '))}</small></td><td>${a.enabled ? 'Active' : 'Disabled'} / ${esc(a.authState)}${a.blocked ? ' / quota blocked' : ''}<small>${esc(a.lastError)}</small></td><td>${esc(quota(a))}</td><td>${action('/account/state', a.id, a.enabled ? 'Deactivate' : 'Activate', `<input type="hidden" name="enabled" value="${!a.enabled}">`)}${action('/account/refresh', a.id, 'Refresh')}${action('/account/labels', a.id, 'Save labels', `<label>Labels <input name="labels" value="${esc(a.labels.join(', '))}"></label>`)}</td></tr>`).join('');
     const callers = v.callers.map(c => `<li>${esc(c.label)} — allow: ${esc(c.allow.join(', ') || 'all')}; block: ${esc(c.block.join(', ') || 'none')}${action('/caller/state', c.id, c.enabled ? 'Disable caller' : 'Enable caller', `<input type="hidden" name="enabled" value="${!c.enabled}">`)}</li>`).join('');
     res.end(page('Broker Proxy', `<p>${v.counters.selected} selections · ${v.counters.responses} upstream responses · ${v.counters.errors} upstream errors. Token usage: unknown.</p>
       <p><a href="${esc(this.config.enrollment.origin)}" target="_blank" rel="noreferrer">Enroll through provider device login</a></p>

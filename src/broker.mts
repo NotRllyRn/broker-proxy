@@ -39,26 +39,29 @@ export class Broker {
     if (this.flights.has(existing.id)) throw new Fault('REFRESH_IN_PROGRESS', 409);
     await this.store.change(s => {
       const a = s.accounts.find(a => a.id === existing.id)!;
-      a.credential = c; a.authState = 'verified'; a.lastError = null;
+      a.credential = c; a.generation = randomUUID(); a.authState = 'verified'; a.lastError = null;
       a.label = text(label); a.labels = labels(accountLabels);
       // Reauthorization does not erase quota blocks, baseline usage, or administrator deactivation.
     });
     return existing.id;
   }
-  private async activate(label: string, accountLabels: string[], c: Credential, identity: string, usage?: unknown, startedAt = this.clock()) {
+  private async activate(label: string, accountLabels: string[], c: Credential, identity: string, usage?: unknown, startedAt = this.clock(), signal?: AbortSignal) {
     const id = randomUUID(), now = this.clock();
     await this.store.change(s => {
+      // Cancellation wins while queued; beginning this transaction is the activation commit boundary.
+      if (signal?.aborted) throw new Fault('CANCELLED', 499);
       if (s.accounts.length >= 1000) throw new Fault('ACCOUNT_LIMIT', 409);
       if (s.accounts.some(a => a.credential.accountId === c.accountId || identity && a.identity === identity)) throw new Fault('DUPLICATE_ACCOUNT', 409);
       s.accounts.push({ id, label, labels: accountLabels, enabled: true, authState: 'verified', createdAt: now,
-        credential: c, identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null });
+        credential: c, generation: randomUUID(), identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null });
     });
     return id;
   }
-  async setAccount(id: string, enabled: boolean, accountLabels?: string[]) {
+  async setAccount(id: string, enabled?: boolean, accountLabels?: string[]) {
     await this.store.change(s => {
       const a = s.accounts.find(a => a.id === id); if (!a) throw new Fault('NOT_FOUND', 404);
-      a.enabled = enabled; if (accountLabels) a.labels = labels(accountLabels);
+      if (enabled !== undefined) a.enabled = enabled;
+      if (accountLabels) a.labels = labels(accountLabels);
     });
   }
   refresh(id: string): Promise<void> {
@@ -80,11 +83,17 @@ export class Broker {
       await this.store.change(s => {
         const a = s.accounts.find(a => a.id === id);
         if (!a || a.credential.accessToken !== original.accessToken) throw new Fault('ACCOUNT_CHANGED', 409);
-        a.credential = result.credential; a.authState = 'verified'; a.lastError = null;
+        a.credential = result.credential; a.generation = randomUUID(); a.authState = 'verified'; a.lastError = null;
         applyQuota(a, normalizeUsage(result.usage, startedAt, this.clock()));
       });
     } catch (e) {
-      await this.store.change(s => { const a = s.accounts.find(a => a.id === id); if (a) { a.authState = 'required'; a.lastError = 'REFRESH_FAILED'; } });
+      await this.store.change(s => {
+        const a = s.accounts.find(a => a.id === id);
+        if (!a || a.credential.accessToken !== original.accessToken || a.authState !== 'refreshing') return;
+        // Admission rejection cannot have rotated credentials; ambiguous provider failures can.
+        const busy = e instanceof Fault && e.code === 'PROVIDER_BUSY';
+        a.authState = busy ? 'verified' : 'required'; a.lastError = busy ? 'PROVIDER_BUSY' : 'REFRESH_FAILED';
+      });
       throw e instanceof Fault ? e : new Fault('REFRESH_FAILED');
     }
   }
@@ -105,14 +114,14 @@ export class Broker {
       return structuredClone(a);
     });
   }
-  async observe(account: string, caller: string, status: number) {
+  async observe(account: string, caller: string, status: number, generation?: string) {
     await this.store.change(s => {
       const a = s.accounts.find(a => a.id === account); if (!a) return;
       s.counters.responses++;
       if (status < 400) return;
       s.counters.errors++;
       if (status === 429) { a.blockedAt = this.clock(); a.lastError = 'QUOTA_OR_RATE_LIMIT'; }
-      else if (status === 401 || status === 403) { a.authState = 'required'; a.lastError = 'UPSTREAM_AUTH_REJECTED'; }
+      else if ((status === 401 || status === 403) && generation === a.generation) { a.authState = 'required'; a.lastError = 'UPSTREAM_AUTH_REJECTED'; }
       else if (status >= 500) exclude(s, a, caller, false, this.clock());
     });
   }
@@ -134,7 +143,7 @@ export class Broker {
         const result = await this.provider.login(signal, device => { if (!signal.aborted) { view.device = device; view.state = 'waiting'; view.expires = Math.min(view.expires, device.expiresAt ?? view.expires); } });
         if (signal.aborted) throw new Fault('CANCELLED');
         view.state = 'verifying'; delete view.device;
-        await this.activate('Example user', this.enrollmentLabels, result.credential, result.identity, result.usage, now);
+        await this.activate('Example user', this.enrollmentLabels, result.credential, result.identity, result.usage, now, signal);
         view.state = 'completed';
       } catch (e) {
         view.state = abort.signal.aborted ? 'cancelled' : signal.aborted || e instanceof Fault && e.code === 'LOGIN_EXPIRED' ? 'expired' : 'failed';

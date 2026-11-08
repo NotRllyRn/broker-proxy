@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { join } from 'node:path';
 import { readFile, writeFile, rm, access } from 'node:fs/promises';
 import { Store } from '../build/store.mjs';
@@ -44,6 +44,8 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const caller = 'fixture-system-caller-012345678901234567890';
   const scoped = 'fixture-scoped-caller-012345678901234567890';
   await seed.addCaller('Work laptop', caller, [], []);
+  const extraCallers = Object.fromEntries(['POST', 'HEAD', 'OPTIONS', 'implicit'].map(name => [name, `fixture-${name}-caller-012345678901234567890`]));
+  for (const secret of Object.values(extraCallers)) await seed.addCaller('Work laptop', secret, [], []);
   await seed.addCaller('Personal usage', scoped, ['private'], []);
   const alpha = auth('a');
   const a = await seed.importAccount('Example user', ['private'], alpha);
@@ -76,13 +78,39 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const first = upstreamRequests[0]; assert.equal(first.path, '/backend/responses'); assert.equal(first.body, '{"input":"fixture"}');
   assert.equal(first.headers.authorization, 'Bearer ' + alpha.tokens.access_token);
   assert.equal(first.headers.cookie, undefined); assert.equal(first.headers['x-api-key'], undefined); assert.equal(first.headers['x-broker-caller'], undefined);
+  const beforeTrailers = upstreamRequests.length;
+  const trailers = await new Promise((resolve, reject) => {
+    const req = httpRequest(origin + '/v1/responses', { method: 'POST', headers: { Authorization: `Bearer ${caller}`, Trailer: 'Authorization, Cookie, X-Api-Key' } }, res => {
+      res.resume(); res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject); req.write('{}');
+    req.addTrailers({ Authorization: 'private-trailer', Cookie: 'private-trailer', 'X-Api-Key': 'private-trailer' }); req.end();
+  });
+  assert.equal(trailers, 400); assert.equal(upstreamRequests.length, beforeTrailers);
   const stream = await request('/v1/responses?stream', caller, { method: 'POST', body: '{}', headers: { Accept: 'text/event-stream' } });
   assert.equal(await stream.text(), 'data: {"delta":"hello"}\n\ndata: [DONE]\n\n');
   const abort = new AbortController(); const cancelledResponse = await request('/v1/responses?cancel', caller, { method: 'POST', body: '{}', signal: abort.signal });
   await cancelledResponse.body.getReader().read(); abort.abort(); await until(() => cancelled);
   const before = upstreamRequests.length;
-  const fallback = await request('/v1/models?fallback', caller, { headers: { 'Content-Length': '0' } }); assert.equal(fallback.status, 200, (await fallback.clone().text()) + '\n' + logs); assert.deepEqual(await fallback.json(), { account: 'b' });
+  // fetch elides Content-Length: 0 on GET; send the explicit bodyless contract using ordinary node:http.
+  const safeRequest = (method, secret) => new Promise((resolve, reject) => {
+    const req = httpRequest(origin + '/v1/models?fallback', { method, headers: { Authorization: `Bearer ${secret}`, 'Content-Length': '0' } }, res => {
+      const chunks = []; res.on('data', b => chunks.push(b)); res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString() }));
+    }); req.on('error', reject); req.end();
+  });
+  const fallback = await safeRequest('GET', caller);
+  assert.equal(fallback.status, 200, fallback.text + '\n' + logs); assert.deepEqual(JSON.parse(fallback.text), { account: 'b' });
   assert.equal(upstreamRequests.length - before, 2);
+  for (const method of ['HEAD', 'OPTIONS']) {
+    const count = upstreamRequests.length, result = await safeRequest(method, extraCallers[method]);
+    assert.equal(result.status, 200, result.text + logs); assert.equal(upstreamRequests.length - count, 2);
+    if (method === 'HEAD') assert.equal(result.text, '');
+  }
+  for (const method of ['POST', 'implicit']) {
+    const count = upstreamRequests.length;
+    const result = await request('/v1/responses?fallback', extraCallers[method], method === 'POST' ? { method: 'POST', body: '{}' } : {});
+    assert.equal(result.status, 503); await result.text(); assert.equal(upstreamRequests.length - count, 1);
+  }
   const scopedResult = await request('/v1/models', scoped); assert.deepEqual(await scopedResult.json(), { account: 'a' });
   const admin = browser(adminOrigin); await admin.request(); await admin.request('/login', { secret: 'fixture-admin-secret' }); await admin.request();
   const status = JSON.parse((await admin.request('/api/status')).text);
@@ -97,7 +125,7 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   await start();
   assert.equal((await request('/v1/models', scoped)).status, 503);
   const freshPublic = browser(publicOrigin); assert.deepEqual(JSON.parse((await freshPublic.request('/status')).text), { state: 'idle' });
-  assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key/);
+  assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key|private-trailer/);
   await stop();
   t.diagnostic(`Verified actual CLI install at ${ref}; two restarts, opaque SSE, cancellation, scoped credentials, managed GET fallback.`);
 });
