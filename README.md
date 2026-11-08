@@ -11,7 +11,7 @@ A real TypeScript account-brokering extension for [ProxyKit](https://github.com/
 
 ## Build and test
 
-Build against the actual ProxyKit SDK, not a vendored imitation. `PROXYKIT_DIR` defaults to `/code/proxykit`. **This version requires the small host correction `ade6cc9`**, committed locally in that checkout but not pushed to ProxyKit's remote. It exposes declared trailer presence to Node; older hosts fail closed. The public baseline alone is insufficient. See [status](docs/STATUS.md) before using another ProxyKit checkout.
+Build against the actual ProxyKit SDK, not a vendored imitation. `PROXYKIT_SOURCE` defaults to `/code/proxykit`. **This version requires the small host correction `ade6cc9`**, committed locally in that checkout but not pushed to ProxyKit's remote. It exposes declared trailer presence to Node; older hosts fail closed. The public baseline alone is insufficient. See [status](docs/STATUS.md) before using another ProxyKit checkout.
 
 ```sh
 cd /code/broker-proxy
