@@ -118,6 +118,20 @@ class Site {
                     case '/account/refresh':
                         await this.broker.refresh(get('id'));
                         break;
+                    case '/account/pulse': {
+                        const abort = new AbortController(), cancel = () => abort.abort();
+                        res.once('close', cancel);
+                        try {
+                            await this.broker.pulse(get('id'), false, abort.signal);
+                        }
+                        finally {
+                            res.removeListener('close', cancel);
+                        }
+                        break;
+                    }
+                    case '/settings/pulses':
+                        await this.broker.setPulseSettings({ enabled: get('enabled') === 'true', short: get('short') === 'true', weekly: get('weekly') === 'true', spacingMs: Number(get('spacingSeconds')) * 1000 });
+                        break;
                     case '/caller/add':
                         await this.broker.addCaller(get('label'), get('secret'), list(get('allow')), list(get('block')));
                         break;
@@ -181,13 +195,16 @@ class Site {
         if (url.pathname !== '/')
             throw new Fault('NOT_FOUND', 404);
         const v = this.broker.view();
-        const quota = (a) => a.quota ? `${a.quota.short.used}% short / ${a.quota.weekly.used}% weekly; observed ${new Date(a.quota.observedAt).toISOString()}` : 'Unknown (not zero)';
+        const time = (at) => at === null || at === undefined ? 'unknown / not scheduled' : new Date(at).toISOString();
+        const quota = (a) => a.quota ? `${a.quota.short.used}% short (${a.quota.short.durationMinutes ?? '?'} min; reset ${time(a.quota.short.reset)}) / ${a.quota.weekly.used}% weekly (${a.quota.weekly.durationMinutes ?? '?'} min; reset ${time(a.quota.weekly.reset)}); observed ${time(a.quota.observedAt)} — ${a.usageFreshness}` : 'Unknown (not zero)';
         const action = (path, id, label, extra = '') => form(path, session.csrf, `<input type="hidden" name="id" value="${esc(id)}">${extra}<button>${label}</button>`);
-        const accounts = v.accounts.map(a => `<tr><td>${esc(a.label)}<small>${esc(a.labels.join(', '))}</small></td><td>${a.enabled ? 'Active' : 'Disabled'} / ${esc(a.authState)}${a.blocked ? ' / quota blocked' : ''}<small>${esc(a.lastError)}</small></td><td>${esc(quota(a))}</td><td>${action('/account/state', a.id, a.enabled ? 'Deactivate' : 'Activate', `<input type="hidden" name="enabled" value="${!a.enabled}">`)}${action('/account/refresh', a.id, 'Refresh')}${action('/account/labels', a.id, 'Save labels', `<label>Labels <input name="labels" value="${esc(a.labels.join(', '))}"></label>`)}</td></tr>`).join('');
+        const accounts = v.accounts.map(a => `<tr><td>${esc(a.label)}<small>${esc(a.labels.join(', '))}</small></td><td>${a.enabled ? 'Active' : 'Disabled'} / ${esc(a.authState)}${a.blocked ? ' / quota blocked' : ''}<small>${esc(a.lastError)}</small></td><td>${esc(quota(a))}<small>Last observation: ${esc(a.usageStatus?.status ?? 'unknown')} ${esc(time(a.usageStatus?.at))}</small><small>${a.stats.selected} selections / ${a.stats.responses} responses / ${a.stats.errors} errors</small><small>Last pulse: ${esc(a.pulse?.last?.status ?? 'none')} ${esc(time(a.pulse?.last?.at))} ${esc(a.pulse?.last?.code)} ${esc(a.pulse?.last?.model)}</small><small>Next pulse opportunity (requires confirmation): ${esc(time(a.nextPulseAt))}. Next check: ${esc(time(a.nextCheckAt))}${a.pulse?.needsConfirmation ? ' — awaiting usage confirmation; no replay' : ''}</small></td><td>${action('/account/state', a.id, a.enabled ? 'Deactivate' : 'Activate', `<input type="hidden" name="enabled" value="${!a.enabled}">`)}${action('/account/refresh', a.id, 'Refresh quota')}${action('/account/pulse', a.id, 'Pulse (uses inference)')}${action('/account/labels', a.id, 'Save labels', `<label>Labels <input name="labels" value="${esc(a.labels.join(', '))}"></label>`)}</td></tr>`).join('');
         const callers = v.callers.map(c => `<li>${esc(c.label)} — allow: ${esc(c.allow.join(', ') || 'all')}; block: ${esc(c.block.join(', ') || 'none')}${action('/caller/state', c.id, c.enabled ? 'Disable caller' : 'Enable caller', `<input type="hidden" name="enabled" value="${!c.enabled}">`)}</li>`).join('');
         res.end(page('Broker Proxy', `<p>${v.counters.selected} selections · ${v.counters.responses} upstream responses · ${v.counters.errors} upstream errors. Token usage: unknown.</p>
       <p><a href="${esc(this.config.enrollment.origin)}" target="_blank" rel="noreferrer">Enroll through provider device login</a></p>
       <table><caption>Accounts and quota snapshots</caption><thead><tr><th>Account</th><th>Status</th><th>Quota</th><th>Actions</th></tr></thead><tbody>${accounts || '<tr><td colspan="4">No accounts yet.</td></tr>'}</tbody></table>
+      <h2>Pulse settings</h2><p>Automatic inference defaults off. Enabling seeds available accounts, then checks provider short/weekly resets with a 45-second grace. One account at a time; pulses use quota and may be rejected. Dashboard GET only shows stored observations (stale after five minutes), never sends inference. Manual Pulse and Refresh quota are separate.</p>
+      ${form('/settings/pulses', session.csrf, ['enabled', 'short', 'weekly'].map(key => `<label><input type="checkbox" name="${key}" value="true" ${v.pulseSettings[key] ? 'checked' : ''}>${key === 'enabled' ? 'Enable automatic pulses' : key + ' reset pulses'}</label>`).join('') + `<label>Minimum global scheduler spacing (seconds, 15–86400) <input type="number" name="spacingSeconds" min="15" max="86400" value="${v.pulseSettings.spacingMs / 1000}" required></label><button>Save pulse settings</button>`)}
       <details><summary>Protected manual credential import (administration/testing only)</summary>${form('/account/import', session.csrf, field('label', 'Label') + field('labels', 'Comma-separated labels') + '<label>Private auth.json <textarea name="auth" required autocomplete="off"></textarea></label><button>Import account</button>')}</details>
       <h2>Callers</h2><ul>${callers}</ul>${form('/caller/add', session.csrf, field('label', 'Caller label') + field('secret', 'New caller secret (at least 32 characters)', 'password') + '<label>Allowed labels (blank means all) <input name="allow"></label><label>Blocked labels <input name="block"></label><button>Add caller</button>')}
       <h2>Recent selections</h2><ul>${v.history.slice(-20).reverse().map(h => `<li>${esc(new Date(h.at).toISOString())}: ${esc(v.callers.find(c => c.id === h.caller)?.label)} → ${esc(v.accounts.find(a => a.id === h.account)?.label)}; exchange ${esc(h.exchange)}, attempt ${h.attempt}</li>`).join('')}</ul>${form('/logout', session.csrf, '<button>Sign out</button>')}`));

@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store.mjs';
 import { Fault, digest, credential, labels, text, publicAccount, type Account, type Caller, type Credential } from './model.mjs';
 import { candidates, retryAt, exclude, applyQuota, normalizeUsage, inScope, exhausted } from './policy.mjs';
-import { ProviderAdmissionFault, type Provider, type Device } from './provider.mjs';
+import { ProviderAdmissionFault, type Provider, type Device, type ProviderResult } from './provider.mjs';
+import { emptyPulse, settings, trackResets, pulseDue, dueTargets, confirms, consume, backoff, confirmObservation, RETRY_MIN, type PulseSettings, type Targets } from './scheduler.mjs';
 
 export type Enrollment = { id: string; state: 'starting' | 'waiting' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'expired'; expires: number; device?: Device; error?: string };
 export class Broker {
@@ -11,7 +12,9 @@ export class Broker {
   private enrollments = new Map<string, { view: Enrollment; abort: AbortController; done: Promise<void> }>();
   private timer: NodeJS.Timeout | undefined;
   private pollJob: Promise<void> = Promise.resolve();
-  private pollIndex = 0;
+  private operationAborts = new Map<string, AbortController>();
+  private automatic = new Set<string>();
+  private ticking = false;
   private starts: number[] = [];
   constructor(readonly store: Store, private provider: Provider, private enrollmentLabels: string[], private clock = Date.now) {}
   authenticate(bearer: string): Caller {
@@ -41,7 +44,7 @@ export class Broker {
       const a = s.accounts.find(a => a.id === existing.id)!;
       a.credential = c; a.generation = randomUUID(); a.authState = 'verified'; a.lastError = null;
       a.label = text(label); a.labels = labels(accountLabels);
-      // Reauthorization does not erase quota blocks, baseline usage, or administrator deactivation.
+      // Reauthorization does not erase quota blocks, pulse ambiguity, or administrator deactivation.
     });
     return existing.id;
   }
@@ -53,7 +56,8 @@ export class Broker {
       if (s.accounts.length >= 1000) throw new Fault('ACCOUNT_LIMIT', 409);
       if (s.accounts.some(a => a.credential.accountId === c.accountId || identity && a.identity === identity)) throw new Fault('DUPLICATE_ACCOUNT', 409);
       s.accounts.push({ id, label, labels: accountLabels, enabled: true, authState: 'verified', createdAt: now,
-        credential: c, generation: randomUUID(), identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null });
+        credential: c, generation: randomUUID(), identity, quota: normalizeUsage(usage, startedAt, now), blockedAt: null, lastError: null,
+        pulse: emptyPulse(), usageStatus: { at: now, status: normalizeUsage(usage, startedAt, now) ? 'complete' : 'incomplete' } });
     });
     return id;
   }
@@ -63,39 +67,107 @@ export class Broker {
       if (enabled !== undefined) a.enabled = enabled;
       if (accountLabels) a.labels = labels(accountLabels);
     });
+    if (enabled === false) this.operationAborts.get(id)?.abort();
+  }
+  async setPulseSettings(value: PulseSettings) {
+    const config = settings(value);
+    await this.store.change(s => { s.pulseSettings = config; });
+    // Changing any automatic policy cancels pending automatic inference; a later tick uses the new policy.
+    for (const id of this.automatic) this.operationAborts.get(id)?.abort();
   }
   refresh(id: string): Promise<void> {
-    if (this.flights.has(id)) return this.flights.get(id)!;
-    const work = this.refreshAccount(id).finally(() => this.flights.delete(id));
-    this.flights.set(id, work);
-    return work;
+    return this.flights.get(id) ?? this.accountOperation(id, false);
   }
-  private async refreshAccount(id: string) {
-    const startedAt = this.clock();
-    const signal = AbortSignal.any([this.stop.signal, AbortSignal.timeout(25000)]);
-    // Installation cannot rotate credentials: do not persist an ambiguous refresh while waiting for it.
-    await this.provider.prepare?.(signal);
-    const original = await this.store.change(s => {
-      const a = s.accounts.find(a => a.id === id); if (!a) throw new Fault('NOT_FOUND', 404);
-      if (a.authState === 'required') throw new Fault('AUTH_REQUIRED', 409);
-      a.authState = 'refreshing'; return structuredClone(a.credential);
+  pulse(id: string, automatic = false, signal?: AbortSignal): Promise<void> {
+    if (this.flights.has(id)) return Promise.reject(new Fault('ACCOUNT_BUSY', 409));
+    if (!this.provider.pulse) return Promise.reject(new Fault('PULSE_UNSUPPORTED', 409));
+    return this.accountOperation(id, true, automatic, signal);
+  }
+  private accountOperation(id: string, pulse: boolean, automatic = false, callerSignal?: AbortSignal): Promise<void> {
+    const abort = new AbortController(); this.operationAborts.set(id, abort);
+    if (automatic) this.automatic.add(id);
+    const signal = AbortSignal.any([this.stop.signal, abort.signal, AbortSignal.timeout(pulse ? 90000 : 25000), ...(callerSignal ? [callerSignal] : [])]);
+    const work = this.runAccount(id, pulse, automatic, signal).finally(() => {
+      this.flights.delete(id); this.operationAborts.delete(id); this.automatic.delete(id);
     });
+    this.flights.set(id, work); return work;
+  }
+  private recordUsage(a: Account, result: Pick<ProviderResult, 'usage' | 'usageStartedAt' | 'observedAt'>, startedAt: number) {
+    trackResets(a, this.clock());
+    const q = normalizeUsage(result.usage, result.usageStartedAt ?? startedAt, result.observedAt ?? this.clock());
+    applyQuota(a, q); confirmObservation(a, q); trackResets(a, this.clock());
+    a.usageStatus = { at: this.clock(), status: q ? 'complete' : 'incomplete' };
+    return q;
+  }
+  private async runAccount(id: string, pulse: boolean, automatic: boolean, signal: AbortSignal) {
+    const startedAt = this.clock();
+    let original: Account | undefined, targets: Targets = { short: null, weekly: null }, dispatched = false;
     try {
-      const result = await this.provider.refresh(original, signal);
-      if (result.credential.accountId !== original.accountId) throw new Fault('IDENTITY_CHANGED');
+      // Preparing an executable cannot rotate credentials; keep it outside the durable auth claim.
+      await this.provider.prepare?.(signal);
+      original = await this.store.change(s => {
+        if (signal.aborted) throw new ProviderAdmissionFault('CANCELLED', 499);
+        const a = s.accounts.find(a => a.id === id); if (!a) throw new Fault('NOT_FOUND', 404);
+        if (a.authState !== 'verified') throw new Fault('AUTH_REQUIRED', 409);
+        const p = a.pulse ??= emptyPulse(); trackResets(a, this.clock());
+        if (pulse) {
+          if (!a.enabled || automatic && !s.pulseSettings.enabled) throw new Fault('PULSE_DISABLED', 409);
+          if (p.needsConfirmation) throw new Fault('PULSE_CONFIRMATION_REQUIRED', 409);
+          if (p.last && this.clock() < p.last.at + RETRY_MIN) throw new Fault('PULSE_BACKOFF', 409);
+          targets = dueTargets(a, s.pulseSettings, this.clock());
+          p.last = { at: this.clock(), status: 'preparing', automatic };
+        }
+        const snapshot = structuredClone(a); a.authState = 'refreshing'; return snapshot;
+      });
+      const generation = original.generation;
+      const current = (s: ReturnType<Store['snapshot']>) => {
+        const a = s.accounts.find(a => a.id === id);
+        if (!a || a.generation !== generation || a.authState !== 'refreshing' || !a.enabled || signal.aborted
+          || automatic && !s.pulseSettings.enabled) throw new Fault('ACCOUNT_CHANGED', 409);
+        return a;
+      };
+      const result = pulse ? await this.provider.pulse!(original.credential, signal, {
+        preflight: (usage, usageStartedAt, observedAt) => this.store.change(s => {
+          const a = current(s), q = this.recordUsage(a, { usage, usageStartedAt, observedAt }, startedAt);
+          return !exhausted(a) && confirms(q, automatic ? targets : { short: null, weekly: null }, this.clock());
+        }),
+        dispatch: () => this.store.change(s => {
+          const a = current(s);
+          if (exhausted(a)) throw new Fault('PULSE_USAGE_UNCONFIRMED', 409);
+          consume(a, targets); a.pulse!.last!.status = 'running'; a.pulse!.needsConfirmation = true;
+          a.pulse!.nextAttemptAt = this.clock() + RETRY_MIN;
+          dispatched = true;
+        }),
+      }) : await this.provider.refresh(original.credential, signal);
+      if (result.credential.accountId !== original.credential.accountId) throw new Fault('IDENTITY_CHANGED');
       await this.store.change(s => {
         const a = s.accounts.find(a => a.id === id);
-        if (!a || a.credential.accessToken !== original.accessToken) throw new Fault('ACCOUNT_CHANGED', 409);
-        a.credential = result.credential; a.generation = randomUUID(); a.authState = 'verified'; a.lastError = null;
-        applyQuota(a, normalizeUsage(result.usage, startedAt, this.clock()));
+        if (!a || a.generation !== generation) throw new Fault('ACCOUNT_CHANGED', 409);
+        // Checkpoint rotations even after disable/cancellation; never undo concurrent auth rejection.
+        a.credential = result.credential; a.generation = randomUUID();
+        if (a.authState === 'refreshing') { a.authState = 'verified'; a.lastError = null; }
+        const q = this.recordUsage(a, result, startedAt), p = a.pulse ??= emptyPulse();
+        if (pulse) {
+          const outcome = result.pulse ?? { status: 'uncertain' as const, code: 'PULSE_RESULT_UNKNOWN' };
+          p.last = { ...p.last!, ...outcome, finishedAt: this.clock() };
+          p.needsConfirmation = dispatched && outcome.status === 'uncertain';
+          if (dispatched) { p.failures = 0; p.nextAttemptAt = this.clock() + RETRY_MIN; }
+          else backoff(p, this.clock());
+        } else if (q) { p.failures = 0; p.nextAttemptAt = Math.max(p.last ? p.last.at + RETRY_MIN : 0, this.clock()); }
+        else backoff(p, this.clock());
       });
     } catch (e) {
+      if (!original && e instanceof Fault && ['PULSE_BACKOFF', 'PULSE_CONFIRMATION_REQUIRED', 'PULSE_DISABLED', 'AUTH_REQUIRED', 'NOT_FOUND'].includes(e.code)) throw e;
       await this.store.change(s => {
-        const a = s.accounts.find(a => a.id === id);
-        if (!a || a.credential.accessToken !== original.accessToken || a.authState !== 'refreshing') return;
-        // Admission rejection cannot have rotated credentials; ambiguous provider failures can.
+        const a = s.accounts.find(a => a.id === id); if (!a || original && a.generation !== original.generation) return;
         const admission = e instanceof ProviderAdmissionFault || e instanceof Fault && e.code === 'PROVIDER_BUSY';
-        a.authState = admission ? 'verified' : 'required'; a.lastError = admission ? e.code : 'REFRESH_FAILED';
+        if (original && a.authState === 'refreshing') { a.authState = admission ? 'verified' : 'required'; a.lastError = admission ? e.code : 'REFRESH_FAILED'; }
+        a.usageStatus = { at: this.clock(), status: 'failed', code: admission ? 'PROVIDER_UNAVAILABLE' : 'OBSERVATION_FAILED' };
+        const p = a.pulse ??= emptyPulse(); backoff(p, this.clock());
+        if (pulse && original) {
+          p.last = { ...p.last!, status: dispatched ? 'uncertain' : 'failed', code: e instanceof Fault ? e.code : 'PULSE_FAILED', finishedAt: this.clock() };
+          p.needsConfirmation = dispatched;
+        }
       });
       throw e instanceof Fault ? e : new Fault('REFRESH_FAILED');
     }
@@ -114,6 +186,7 @@ export class Broker {
         || a.credential.expiresAt <= this.clock() || next.exclusions.some(e => e.caller === callerId && e.account === a.id && e.until > this.clock())) throw new Fault('ACCOUNT_CHANGED', 409);
       next.history.push({ at: this.clock(), exchange, attempt, caller: callerId, account: a.id });
       next.history = next.history.slice(-200); next.counters.selected++;
+      (a.stats ??= { selected: 0, responses: 0, errors: 0 }).selected++;
       return structuredClone(a);
     });
   }
@@ -121,8 +194,9 @@ export class Broker {
     await this.store.change(s => {
       const a = s.accounts.find(a => a.id === account); if (!a) return;
       s.counters.responses++;
+      (a.stats ??= { selected: 0, responses: 0, errors: 0 }).responses++;
       if (status < 400) return;
-      s.counters.errors++;
+      s.counters.errors++; a.stats.errors++;
       if (status === 429) { a.blockedAt = this.clock(); a.lastError = 'QUOTA_OR_RATE_LIMIT'; }
       else if ((status === 401 || status === 403) && generation === a.generation) { a.authState = 'required'; a.lastError = 'UPSTREAM_AUTH_REJECTED'; }
       else if (status >= 500) exclude(s, a, caller, false, this.clock());
@@ -130,7 +204,12 @@ export class Broker {
   }
   view() {
     const s = this.store.snapshot();
-    return { accounts: s.accounts.map(publicAccount), callers: s.callers.map(({ digest: _, ...c }) => c), history: s.history, counters: s.counters };
+    const nextCheck = (a: Account) => { trackResets(a, this.clock()); const due = pulseDue(a, s.pulseSettings, this.clock()); return due === null ? null : Math.max(this.clock(), s.scheduler.nextAt, due); };
+    return { pulseSettings: s.pulseSettings, accounts: s.accounts.map(a => ({ ...publicAccount(a),
+      usageFreshness: !a.quota ? 'unknown' : this.clock() - a.quota.observedAt > 300000 || a.usageStatus?.status !== 'complete' ? 'stale' : 'fresh',
+      nextPulseAt: a.pulse?.needsConfirmation || !s.pulseSettings.enabled ? null : nextCheck(a),
+      nextCheckAt: nextCheck(a),
+    })), callers: s.callers.map(({ digest: _, ...c }) => c), history: s.history, counters: s.counters };
   }
   startEnrollment(): Enrollment {
     const now = this.clock(); this.prune();
@@ -171,14 +250,32 @@ export class Broker {
       e.abort.abort(); if (terminal(e.view.state)) this.enrollments.delete(id);
     }
   }
+  async schedulerTick(interval = 0) {
+    if (this.ticking || this.stop.signal.aborted) return;
+    this.ticking = true;
+    try {
+      const now = this.clock(), snapshot = this.store.snapshot();
+      if (snapshot.scheduler.nextAt > now) return;
+      const accounts = snapshot.accounts.filter(a => a.enabled && a.authState === 'verified' && !this.flights.has(a.id));
+      for (const a of accounts) trackResets(a, now);
+      const due = accounts.filter(a => pulseDue(a, snapshot.pulseSettings, now) !== null && pulseDue(a, snapshot.pulseSettings, now)! <= now)
+        .sort((a, b) => (pulseDue(a, snapshot.pulseSettings, now)! - pulseDue(b, snapshot.pulseSettings, now)!) || a.id.localeCompare(b.id));
+      const regular = accounts.filter(a => (a.pulse?.nextAttemptAt ?? 0) <= now);
+      const account = due[0] ?? (interval && snapshot.scheduler.nextRegularAt <= now && regular.length ? regular[snapshot.scheduler.cursor % regular.length] : undefined);
+      if (!account) return;
+      await this.store.change(s => {
+        s.scheduler.nextAt = now + s.pulseSettings.spacingMs;
+        if (!due.length) { s.scheduler.nextRegularAt = now + interval; s.scheduler.cursor = (s.scheduler.cursor + 1) % 1000; }
+        for (const a of s.accounts) trackResets(a, now);
+      });
+      if (due.length && !account.pulse?.needsConfirmation) await this.pulse(account.id, true);
+      else await this.refresh(account.id);
+    } finally { this.ticking = false; }
+  }
   startPolling(interval: number) {
-    if (!interval) return;
     const tick = () => { this.timer = setTimeout(() => {
-      this.pollJob = (async () => {
-        const accounts = this.store.snapshot().accounts.filter(a => a.enabled && a.authState === 'verified');
-        if (accounts.length) await this.refresh(accounts[this.pollIndex++ % accounts.length]!.id);
-      })().catch(() => {}).finally(() => { if (!this.stop.signal.aborted) tick(); });
-    }, interval); };
+      this.pollJob = this.schedulerTick(interval).catch(() => {}).finally(() => { if (!this.stop.signal.aborted) tick(); });
+    }, 15000); };
     tick();
   }
   async close() {

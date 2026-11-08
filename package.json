@@ -6,7 +6,7 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "npm run build && node --test test/broker.test.mjs test/codex-install.test.mjs test/config.test.mjs test/extension.test.mjs test/policy.test.mjs test/provider.test.mjs test/regression.test.mjs test/web.test.mjs",
+    "test": "npm run build && node --test test/broker.test.mjs test/codex-install.test.mjs test/config.test.mjs test/extension.test.mjs test/policy.test.mjs test/provider.test.mjs test/regression.test.mjs test/pulse.test.mjs test/scheduler.test.mjs test/web.test.mjs",
     "test:codex": "npm run build && node --test test/codex-real.test.mjs",
     "test:system": "npm run build && node --test test/system.test.mjs",
     "demo": "node scripts/demo.mjs"

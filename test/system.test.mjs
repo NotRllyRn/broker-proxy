@@ -118,6 +118,18 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const status = JSON.parse((await admin.request('/api/status')).text);
   assert.ok(status.history.some(h => h.attempt >= 1));
   assert.equal(status.accounts.length, 2);
+  assert.equal(status.pulseSettings.enabled, false);
+  assert.ok(status.accounts.find(account => account.id === a).stats.responses > 0);
+  assert.equal((await admin.request('/account/pulse', { id: a })).status, 303);
+  let pulses = JSON.parse((await admin.request('/api/status')).text);
+  assert.equal(pulses.accounts.find(account => account.id === a).pulse.last.status, 'completed');
+  assert.equal((await admin.request('/settings/pulses', { enabled: 'true', short: 'true', weekly: 'true', spacingSeconds: '15' })).status, 303);
+  await until(async () => {
+    pulses = JSON.parse((await admin.request('/api/status')).text);
+    return pulses.accounts.some(account => account.id !== a && account.pulse?.last?.automatic && account.pulse.last.status === 'completed');
+  }, 35000);
+  assert.equal((await admin.request('/settings/pulses', { spacingSeconds: '60' })).status, 303);
+  assert.doesNotMatch(JSON.stringify(pulses), /fixture-rotated|access_token|refresh_token/);
   const publicBrowser = browser(publicOrigin); await publicBrowser.request(); await publicBrowser.request('/start', {});
   await until(async () => JSON.parse((await publicBrowser.request('/status')).text).state === 'completed');
   await admin.request('/account/state', { id: a, enabled: 'false' });
@@ -126,9 +138,14 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   for (const url of [adminOrigin, publicOrigin, origin]) await assert.rejects(fetch(url));
   await start();
   assert.equal((await request('/v1/models', scoped)).status, 503);
+  const freshAdmin = browser(adminOrigin); await freshAdmin.request(); await freshAdmin.request('/login', { secret: 'fixture-admin-secret' }); await freshAdmin.request();
+  const recovered = JSON.parse((await freshAdmin.request('/api/status')).text);
+  assert.equal(recovered.pulseSettings.enabled, false);
+  assert.equal(recovered.accounts.find(account => account.id === a).pulse.last.status, 'completed');
+  assert.ok(recovered.accounts.some(account => account.pulse?.last?.automatic));
   const freshPublic = browser(publicOrigin); assert.deepEqual(JSON.parse((await freshPublic.request('/status')).text), { state: 'idle' });
   assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key|private-trailer/);
   await stop();
   await assert.rejects(access(join(dataDir, 'codex'))); // Explicit fixture override must never install the real CLI.
-  t.diagnostic(`Verified actual CLI install at ${ref}; two restarts, opaque SSE, cancellation, scoped credentials, managed GET fallback.`);
+  t.diagnostic(`Verified actual CLI install at ${ref}; two restarts, opaque SSE, cancellation, scoped credentials, managed GET fallback; manual and background scheduled account pulses/settings/stats with isolated app-server fixture (not live-provider verification).`);
 });

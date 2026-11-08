@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { defaultSettings } from './scheduler.mjs';
 export class Fault extends Error {
     code;
     status;
@@ -10,7 +11,7 @@ export class Fault extends Error {
 }
 export const token = () => randomBytes(32).toString('base64url');
 export const digest = (value) => createHash('sha256').update(value).digest('hex');
-export const emptyState = () => ({ version: 1, accounts: [], callers: [], exclusions: [], history: [], counters: { selected: 0, responses: 0, errors: 0, bytes: 0 } });
+export const emptyState = () => ({ version: 1, accounts: [], callers: [], pulseSettings: defaultSettings(), scheduler: { nextAt: 0, nextRegularAt: 0, cursor: 0 }, exclusions: [], history: [], counters: { selected: 0, responses: 0, errors: 0, bytes: 0 } });
 export const object = (v) => {
     if (!v || typeof v !== 'object' || Array.isArray(v))
         throw new Fault('INVALID_OBJECT', 400);
@@ -45,5 +46,6 @@ export function credential(auth, now = Date.now()) {
 }
 export function publicAccount(a) {
     return { id: a.id, label: a.label, labels: a.labels, enabled: a.enabled, authState: a.authState,
-        quota: a.quota, blocked: a.blockedAt !== null, lastError: a.lastError };
+        quota: a.quota, blocked: a.blockedAt !== null, lastError: a.lastError, pulse: a.pulse ?? null,
+        usageStatus: a.usageStatus ?? null, stats: a.stats ?? { selected: 0, responses: 0, errors: 0 } };
 }

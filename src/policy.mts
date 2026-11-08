@@ -45,7 +45,7 @@ export function normalizeUsage(payload: unknown, startedAt: number, observedAt: 
     if (weeks.length !== 1 || !shorts.length || shorts.length > 1 && shorts[0]!.windowDurationMins === shorts[1]!.windowDurationMins) return null;
     const window = (v: Record<string, unknown>): Window => {
       if (typeof v.usedPercent !== 'number' || !Number.isFinite(v.usedPercent) || v.usedPercent < 0 || v.usedPercent > 100) throw Error();
-      return { used: Math.trunc(v.usedPercent), reset: typeof v.resetsAt === 'number' && Number.isSafeInteger(v.resetsAt * 1000) && v.resetsAt > 0 ? v.resetsAt * 1000 : null };
+      return { used: v.usedPercent, durationMinutes: Number(v.windowDurationMins), reset: typeof v.resetsAt === 'number' && Number.isSafeInteger(v.resetsAt * 1000) && v.resetsAt > 0 ? v.resetsAt * 1000 : null };
     };
     return { short: window(shorts[0]!), weekly: window(weeks[0]!), startedAt, observedAt };
   } catch { return null; }

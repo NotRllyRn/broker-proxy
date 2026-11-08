@@ -2,6 +2,7 @@ import { mkdir, readFile, open, rename, unlink, chmod, lstat, rm } from 'node:fs
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { emptyState, Fault, object, credential, labels, text } from './model.mjs';
+import { defaultSettings, emptyPulse, settings, windows } from './scheduler.mjs';
 export const STATE_LIMIT = 32 * 1024 * 1024;
 function validate(value) {
     const s = object(value);
@@ -9,6 +10,11 @@ function validate(value) {
         || s.accounts.length > 1000 || s.callers.length > 1000 || s.history.length > 200)
         throw new Fault('INVALID_STATE');
     const state = s;
+    state.pulseSettings = settings(state.pulseSettings ?? defaultSettings());
+    state.scheduler ??= { nextAt: 0, nextRegularAt: 0, cursor: 0 };
+    const nonnegative = (v) => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+    if (!['nextAt', 'nextRegularAt', 'cursor'].every(k => nonnegative(object(state.scheduler)[k])))
+        throw new Fault('INVALID_STATE');
     const ids = new Set();
     for (const a of state.accounts) {
         text(a.id);
@@ -20,6 +26,24 @@ function validate(value) {
             || !Number.isFinite(a.createdAt) || !a.credential || typeof a.identity !== 'string')
             throw new Fault('INVALID_STATE');
         ids.add(a.id);
+        const p = a.pulse ??= emptyPulse();
+        if (typeof p.initialized !== 'boolean' || typeof p.needsConfirmation !== 'boolean' || !nonnegative(p.nextAttemptAt) || !nonnegative(p.failures) || p.failures > 5)
+            throw new Fault('INVALID_STATE');
+        for (const k of windows)
+            for (const targets of [p.targets, p.handled])
+                if (!targets || targets[k] !== null && !nonnegative(targets[k]))
+                    throw new Fault('INVALID_STATE');
+        if (p.last && (!nonnegative(p.last.at) || p.last.finishedAt !== undefined && !nonnegative(p.last.finishedAt)
+            || typeof p.last.automatic !== 'boolean' || !['preparing', 'running', 'completed', 'failed', 'uncertain', 'skipped'].includes(p.last.status)))
+            throw new Fault('INVALID_STATE');
+        if (p.last?.code)
+            text(p.last.code, 120);
+        if (p.last?.model)
+            text(p.last.model, 200);
+        if (a.usageStatus && (!nonnegative(a.usageStatus.at) || !['complete', 'incomplete', 'failed'].includes(a.usageStatus.status)))
+            throw new Fault('INVALID_STATE');
+        if (a.stats && !['selected', 'responses', 'errors'].every(k => nonnegative(object(a.stats)[k])))
+            throw new Fault('INVALID_STATE');
         const c = credential(a.credential.auth, 0);
         if (c.accessToken !== a.credential.accessToken || c.accountId !== a.credential.accountId || c.expiresAt !== a.credential.expiresAt)
             throw new Fault('INVALID_STATE');
@@ -96,11 +120,20 @@ export class Store {
                 if (e.code !== 'ENOENT')
                     throw new Fault('INVALID_STATE');
             }
-            await store.change(s => { for (const a of s.accounts)
-                if (a.authState === 'refreshing') {
-                    a.authState = 'required';
-                    a.lastError = 'INTERRUPTED_REFRESH';
-                } });
+            await store.change(s => {
+                for (const a of s.accounts) {
+                    if (a.authState === 'refreshing') {
+                        a.authState = 'required';
+                        a.lastError = 'INTERRUPTED_REFRESH';
+                    }
+                    if (a.pulse?.last && ['preparing', 'running'].includes(a.pulse.last.status)) {
+                        // Never replay a potentially dispatched pulse after a crash, even after reauthorization.
+                        a.pulse.last.status = 'uncertain';
+                        a.pulse.last.code = 'INTERRUPTED_PULSE';
+                        a.pulse.needsConfirmation = true;
+                    }
+                }
+            });
             // This directory is exclusively extension-owned; never point it at an existing Codex home.
             await rm(join(dir, 'runtimes'), { recursive: true, force: true });
             return store;

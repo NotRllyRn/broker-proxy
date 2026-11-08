@@ -7,7 +7,7 @@ import { Broker } from '../build/broker.mjs';
 import { CodexProvider } from '../build/provider.mjs';
 import { startWeb } from '../build/web.mjs';
 import { digest } from '../build/model.mjs';
-import { temp, port, fixtureCommand, until } from './helpers.mjs';
+import { temp, port, fixtureCommand, until, auth } from './helpers.mjs';
 
 export function browser(origin) {
   let cookie = '', csrf = '';
@@ -75,6 +75,49 @@ test('public cancellation terminates runtime and restart invalidates enrollment 
   await broker.cancelEnrollment(e.id); assert.equal(broker.enrollment(e.id).state, 'cancelled');
   assert.equal(broker.view().accounts.length, 0);
 });
+test('real HTTP pulse/settings actions enforce auth/CSRF; GET shows stored stats without provider work', async t => {
+  const dir = await temp(), a = await port(), b = await port();
+  const config = { adminHash: digest('fixture-admin-secret'), dashboard: { host: '127.0.0.1', port: a, origin: `http://127.0.0.1:${a}` }, enrollment: { host: '127.0.0.1', port: b, origin: `http://127.0.0.1:${b}` } };
+  const broker = new Broker(await Store.open(join(dir, 'state')), new CodexProvider(join(dir, 'runtimes'), await fixtureCommand(dir)), []);
+  const id = await broker.importAccount('Personal usage', [], auth());
+  const close = await startWeb(broker, config);
+  t.after(async () => { await close(); await broker.close(); await rm(dir, { recursive: true, force: true }); });
+  const admin = browser(config.dashboard.origin), publicBrowser = browser(config.enrollment.origin);
+  await admin.request(); await publicBrowser.request();
+  for (const path of ['/account/pulse', '/settings/pulses']) {
+    assert.equal((await admin.request(path, { id })).status, 401);
+    assert.equal((await publicBrowser.request(path, { id })).status, 404);
+  }
+  await admin.request('/login', { secret: 'fixture-admin-secret' }); await admin.request();
+  const before = JSON.stringify(broker.store.snapshot());
+  assert.match((await admin.request()).text, /Unknown \(not zero\)/);
+  await admin.request('/api/status');
+  assert.equal((await admin.request('/account/pulse')).status, 404);
+  assert.equal(JSON.stringify(broker.store.snapshot()), before);
+  assert.equal((await admin.request('/account/pulse', { id, csrf: 'wrong' })).status, 403);
+  assert.equal((await admin.request('/settings/pulses', { enabled: 'true', short: 'true', spacingSeconds: '15' }, { Origin: 'https://evil.invalid' })).status, 403);
+  assert.equal((await admin.request('/settings/pulses', { enabled: 'true', spacingSeconds: '0' })).status, 400);
+  assert.equal((await admin.request('/account/refresh', { id })).status, 303);
+  assert.equal(broker.view().accounts[0].pulse.last, undefined);
+  assert.equal((await admin.request('/account/pulse', { id })).status, 303);
+  let status = JSON.parse((await admin.request('/api/status')).text);
+  assert.equal(status.accounts[0].pulse.last.status, 'completed'); assert.equal(status.accounts[0].usageFreshness, 'fresh');
+  assert.equal(status.accounts[0].quota.short.durationMinutes, 300);
+  assert.equal((await admin.request('/account/pulse', { id })).status, 409);
+  const caller = await broker.addCaller('Work laptop', 'fixture-caller-012345678901234567890', [], []);
+  await broker.select(caller, '', 'fixture-exchange', 0, new AbortController().signal); await broker.observe(id, caller, 200);
+  await broker.observe(id, caller, 500);
+  status = JSON.parse((await admin.request('/api/status')).text);
+  assert.deepEqual(status.accounts[0].stats, { selected: 1, responses: 2, errors: 1 });
+  assert.equal((await admin.request('/settings/pulses', { enabled: 'true', short: 'true', weekly: 'true', spacingSeconds: '15' })).status, 303);
+  assert.equal(broker.view().pulseSettings.enabled, true);
+  assert.equal((await admin.request('/settings/pulses', { spacingSeconds: '60' })).status, 303);
+  assert.equal(broker.view().pulseSettings.enabled, false);
+  await broker.store.change(s => { s.accounts[0].quota.observedAt -= 600000; });
+  const home = await admin.request(); assert.match(home.text, /stale/); assert.match(home.text, /Refresh quota/); assert.match(home.text, /Pulse \(uses inference\)/);
+  assert.doesNotMatch(home.text + JSON.stringify(status), /refresh_token|access_token|fixture-rotated|discard-private/);
+});
+
 test('second-listener startup failure releases first port', async t => {
   const dir = await temp(); const a = await port(), b = await port();
   const { createServer } = await import('node:http');

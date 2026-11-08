@@ -2,7 +2,7 @@
 
 A real TypeScript account-brokering extension for [ProxyKit](https://github.com/NotRllyRn/proxykit), intended as a small first successor to [Codex Broker](https://github.com/NotRllyRn/codex-broker).
 
-**Implemented and locally tested:** installed Node extension, durable accounts/callers, scoped quota-aware selection, serialized credential refresh, a minimal dashboard, and a separate device-enrollment site. **Not yet verified with a live provider account.** The provider adapter uses `codex app-server`; fixture tests are not OAuth/provider certification. See [capability status and security limits](docs/STATUS.md).
+**Implemented and locally tested:** installed Node extension, durable accounts/callers, scoped quota-aware selection, serialized credential refresh, account-specific inference pulses and reset scheduling, a minimal dashboard with per-account observations/counters, and a separate device-enrollment site. **Not yet verified with a live provider account.** The provider adapter uses `codex app-server`; fixture tests are not OAuth/provider certification. See [capability status and security limits](docs/STATUS.md).
 
 - ProxyKit keeps its existing inference listener and Go transport. This package does not implement a second inference proxy.
 - Dashboard defaults to `http://127.0.0.1:8788`; public enrollment defaults to `http://127.0.0.1:8789`.
@@ -34,7 +34,7 @@ npm run demo
 
 The script installs this commit through ProxyKit's CLI into a disposable extension directory, seeds synthetic credentials, starts a **mock upstream**, then starts ProxyKit with both web services. Nothing calls a live provider. Synthetic demo values are deliberately public:
 
-1. Open **http://127.0.0.1:8788**, sign in with `fixture-demo-admin`. Inspect quota timestamps, disable/enable the account, edit labels, and refresh.
+1. Open **http://127.0.0.1:8788**, sign in with `fixture-demo-admin`. Inspect stored quota/freshness, per-account counters and pulse status. **Refresh quota** does not send inference; **Pulse (uses inference)** runs a synthetic account-specific turn. Enable automatic pulses in the small settings form to schedule initial/window pulses; use a newly enrolled fixture account to see an initial scheduled pulse without waiting for a future reset. The fixture does not contact OpenAI. Disable automatic pulses again to demonstrate durable settings.
 2. Open **http://127.0.0.1:8789**, start device enrollment. It auto-completes after a short fixture delay. **Do not enter the fixture code at OpenAI.** A repeated enrollment is rejected as a duplicate.
 3. Send a request through the real ProxyKit listener:
 
@@ -45,7 +45,7 @@ The script installs this commit through ProxyKit's CLI into a disposable extensi
    ```
 
    Add `"stream":true` to see opaque fixture SSE. This is not a complete emulation of the Responses API.
-4. Ctrl-C stops the worker, both sites and the upstream. The script prints its private temporary state directory. Run `BROKER_DEMO_DIR=/that/directory npm run demo` to demonstrate durable account/caller state. Browser sessions intentionally do not survive restart.
+4. Ctrl-C stops the worker, both sites and the upstream. The script prints its private temporary state directory. Run `BROKER_DEMO_DIR=/that/directory npm run demo` to demonstrate durable account/caller state. Browser sessions intentionally do not survive restart; quota observations, pulse outcomes/settings and counters do.
 
 All listeners bind loopback. Optional port overrides: `BROKER_DEMO_PROXY_PORT`, `BROKER_DEMO_ADMIN_PORT`, `BROKER_DEMO_ENROLLMENT_PORT`, `BROKER_DEMO_UPSTREAM_PORT`. Never reuse these published fixture secrets or this mock configuration for real accounts.
 
@@ -91,12 +91,24 @@ The broker manages **official `@openai/codex@0.167.0`** by default; the server d
 | `enrollmentLabels` | `["Personal usage"]`; assigned by operator, never public visitor |
 | `upstream` | `https://chatgpt.com/backend-api/codex`; fixed trusted origin/base path |
 | `codexCommand` | Omitted: broker-managed **0.167.0**; explicit executable path/name bypasses installation and version checks |
-| `pollMs` | `90000`; one sequential account refresh per tick; `0` disables; otherwise 45,000–86,400,000 |
+| `pollMs` | `90000`; one sequential account refresh per tick; `0` disables ordinary polling, **not enabled automatic pulses or ambiguity confirmation**; otherwise 45,000–86,400,000 |
 | `safeFallback` | `false`; opt-in narrow managed safe-method fallback, described below |
 
 The data adapter supports `/v1/responses` and `/v1/models` (also unprefixed equivalents); it does not translate arbitrary OpenAI-compatible APIs. It replaces caller credentials with the selected account's bearer and `Chatgpt-Account-Id`. An optional `X-Broker-Preferred-Account` uses an internal account ID from authenticated `/api/status`, only after scope/reset ordering. Provider behavior at these paths remains live-unverified.
 
 For external access, terminate TLS at a trusted reverse proxy. Configure each listener's exact `origin`, e.g. `"origin":"https://enroll.example.invalid"`, and preserve that Host and browser Origin. Non-loopback binds require an HTTPS origin; **the application itself does not serve TLS**. Keep backend ports firewalled; do not trust arbitrary forwarded headers. HTTPS origins enable Secure cookies. Do not expose the administration site just because enrollment is public. Apply edge admission/rate limits to public enrollment; built-in finite/global limits prevent unbounded work, not denial of service.
+
+### Pulses, scheduling and usage
+
+**Automatic inference is OFF by default.** Enable it explicitly in the authenticated dashboard's pulse settings (CSRF/origin protected), choose short and/or weekly windows, and set global scheduler spacing in seconds (default **60**, range **15–86,400**). Settings live in private durable state, not `config.json`. Enabling schedules one initial pulse for each enabled, verified account, then pulses after selected provider-reported resets. New eligible accounts are included. This consumes provider quota; admission/availability can prevent a pulse. It is not a guarantee that every account can pulse at every reset.
+
+- **Real adapter, live-unverified:** each pulse uses the selected account's isolated `codex app-server` runtime, refreshes identity/quota, chooses an advertised text model (mini preferred; minimal/low reasoning where offered), then `thread/start` (ephemeral, no approvals, read-only) → `turn/start` with **“Reply OK.”** It matches thread/turn completion, ignores transcript/deltas, rereads quota and durably checkpoints changed credentials before routing. It does not call the broker selector or guess an OAuth/HTTP inference protocol. Manual Pulse is an authenticated POST, separate from Refresh quota.
+- **Provider timing, not a five-day timer:** the short window is normally **five hours**; the weekly window normally seven days. Observed duration and reset timestamps drive display/scheduling, with a **45-second reset grace** and a fresh, complete two-window read showing advanced future resets before a due pulse. Either exhausted window or an uncleared quota block prevents inference. Elapsed time and successful inference never clear exhaustion; only confirmed observations can do that. Short/weekly resets due together coalesce into one operation. Window settings affect automatic triggers, not safety checks of both windows.
+- **Bounded work:** a 15-second scheduler tick selects at most one account operation and enforces durable global spacing; regular refreshes share that lane. Per-account pulse/refresh operations cannot overlap. Provider subprocess admission remains four total (public logins leave a slot). Pulses have a 90-second total deadline; refreshes 25 seconds. Manual pulses have a five-minute minimum per-account interval. Failed/unconfirmed preflight work backs off 5, 10, 20, then up to 60 minutes. Ordinary successful quota reads may bring a due confirmation forward, but not bypass the five-minute pulse floor.
+- **Crash/timeout safety:** reset targets, handled resets, outcomes, backoff and global spacing are durable. The dispatch boundary is committed before sending inference. Ambiguous dispatched attempts require a fresh quota read after grace and are **not automatically replayed for the same reset**; a later reset or deliberate manual pulse can proceed after confirmation. An interrupted credential operation remains quarantined until protected reimport; restart does not recover possibly rotated credentials from an abandoned home. Disable stops new automatic work and cancels in-flight automatic operations; already dispatched inference cannot be undone. Safely read rotations are checkpointed without re-enabling an account or overriding concurrent credential replacement/auth rejection.
+- **Dashboard GET is read-only:** it shows the latest stored quota percentage, provider duration/reset, observation timestamp, fresh/stale/unknown status, last pulse and earliest next pulse/check (not a promised dispatch time). No GET sends inference, refreshes credentials or starts provider work. Observations older than five minutes or followed by failed/incomplete reads are marked stale; unknown is not zero. Refresh quota explicitly or enable ordinary polling. Counters are persisted per-account broker selections/upstream statuses/errors since this feature; they exclude pulses and are **not tokens, costs or historical totals**.
+
+This is a reset-driven subset, **not** Codex Broker's full HELD/RELEASING/IN_CYCLE cadence, rolling-window/two-read cycle reconciliation, first-four usage lane, daily sweep or persistent event outbox. Provider completion failures are recorded, not automatically retried for the same reset; unknown model catalogs fail closed. Existing stream/fallback/security limitations below still apply.
 
 ## Operational limits
 
