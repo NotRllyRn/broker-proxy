@@ -24,11 +24,14 @@ const bearer = (input: HTTPInput) => {
 const setup: HTTPSetup = async api => {
   const config = await loadConfig();
   const store = await Store.open(config.dataDir);
-  const broker = new Broker(store, new CodexProvider(join(config.dataDir, 'runtimes'), config.codexCommand), config.enrollmentLabels);
+  const provider = new CodexProvider(join(config.dataDir, 'runtimes'), config.codexCommand);
+  const broker = new Broker(store, provider, config.enrollmentLabels);
   let closeWeb: (() => Promise<void>) | undefined;
   try { closeWeb = await startWeb(broker, config); }
   catch { await broker.close(); throw new Error('Broker listeners could not start'); }
   api.cleanup(async () => { await closeWeb!(); await broker.close(); });
+  // Host setup has a 10s deadline; installation must not block hook registration/readiness.
+  void provider.prepare().catch(e => { if (!broker.stop.signal.aborted) api.log('Codex preparation failed:', e instanceof Fault ? e.code : 'CODEX_INSTALL_FAILED'); });
   broker.startPolling(config.pollMs);
   api.on({ id: 'authenticate', stage: 'request', bodyMode: 'none', order: -1000, failure: 'block' }, input => {
     try {

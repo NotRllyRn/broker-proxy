@@ -2,7 +2,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { Fault, object, text, labels } from './model.mjs';
 export type Listener = { host: string; port: number; origin: string };
-export type Config = { dataDir: string; upstream: string; adminHash: string; codexCommand: string;
+export type Config = { dataDir: string; upstream: string; adminHash: string; codexCommand: string | undefined;
   dashboard: Listener; enrollment: Listener; enrollmentLabels: string[]; pollMs: number; safeFallback: boolean };
 function listener(value: unknown, port: number): Listener {
   const v = value ? object(value) : {};
@@ -31,6 +31,6 @@ export async function loadConfig(path = process.env.BROKER_CONFIG): Promise<Conf
   if (!Number.isSafeInteger(pollMs) || Number(pollMs) !== 0 && (Number(pollMs) < 45000 || Number(pollMs) > 86400000)) throw new Fault('INVALID_POLL_INTERVAL');
   const dashboard = listener(v.dashboard, 8788), enrollment = listener(v.enrollment, 8789);
   if (dashboard.port === enrollment.port || dashboard.origin === enrollment.origin) throw new Fault('SEPARATE_PORTS_REQUIRED');
-  return { dataDir, adminHash, upstream: upstream.href.replace(/\/$/, ''), codexCommand: typeof v.codexCommand === 'string' ? text(v.codexCommand, 4096) : 'codex',
+  return { dataDir, adminHash, upstream: upstream.href.replace(/\/$/, ''), codexCommand: v.codexCommand === undefined ? undefined : text(v.codexCommand, 4096),
     dashboard, enrollment, enrollmentLabels: labels(v.enrollmentLabels ?? ['Personal usage']), pollMs: Number(pollMs), safeFallback: v.safeFallback === true };
 }

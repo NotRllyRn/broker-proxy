@@ -37,6 +37,6 @@ export async function loadConfig(path = process.env.BROKER_CONFIG) {
     const dashboard = listener(v.dashboard, 8788), enrollment = listener(v.enrollment, 8789);
     if (dashboard.port === enrollment.port || dashboard.origin === enrollment.origin)
         throw new Fault('SEPARATE_PORTS_REQUIRED');
-    return { dataDir, adminHash, upstream: upstream.href.replace(/\/$/, ''), codexCommand: typeof v.codexCommand === 'string' ? text(v.codexCommand, 4096) : 'codex',
+    return { dataDir, adminHash, upstream: upstream.href.replace(/\/$/, ''), codexCommand: v.codexCommand === undefined ? undefined : text(v.codexCommand, 4096),
         dashboard, enrollment, enrollmentLabels: labels(v.enrollmentLabels ?? ['Personal usage']), pollMs: Number(pollMs), safeFallback: v.safeFallback === true };
 }

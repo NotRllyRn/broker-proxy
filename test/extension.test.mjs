@@ -6,14 +6,14 @@ import setup from '../build/extension.mjs';
 import { Broker } from '../build/broker.mjs';
 import { Store } from '../build/store.mjs';
 import { digest } from '../build/model.mjs';
-import { temp, port } from './helpers.mjs';
+import { temp, port, fixtureCommand } from './helpers.mjs';
 // Handler contract unit test; installed-host behavior is covered separately by system.test.mjs.
 test('request hook fails closed on old hosts and rejects declared trailers/forged identity', async t => {
   const dir = await temp(), path = join(dir, 'config.json'), dataDir = join(dir, 'data');
   const caller = 'fixture-contract-caller-01234567890123456789';
   const seed = new Broker(await Store.open(dataDir), { close: async () => {} }, []);
   await seed.addCaller('Work laptop', caller, [], []); await seed.close();
-  await writeFile(path, JSON.stringify({ dataDir, adminHash: digest('fixture-admin'), dashboard: { port: await port() }, enrollment: { port: await port() }, pollMs: 0 }), { mode: 0o600 });
+  await writeFile(path, JSON.stringify({ dataDir, codexCommand: await fixtureCommand(dir), adminHash: digest('fixture-admin'), dashboard: { port: await port() }, enrollment: { port: await port() }, pollMs: 0 }), { mode: 0o600 });
   const previous = process.env.BROKER_CONFIG; process.env.BROKER_CONFIG = path;
   const hooks = new Map(); let cleanup;
   t.after(async () => {

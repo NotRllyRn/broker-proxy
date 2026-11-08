@@ -21,6 +21,8 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   assert.match(installed.stdout + installed.stderr, /Installed broker-proxy/);
   const installation = JSON.parse(await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'installation.json')));
   assert.ok(JSON.stringify(installation).includes(ref));
+  const shippedLock = await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'package', 'codex', 'package-lock.json'));
+  assert.deepEqual(shippedLock, await readFile(new URL('../codex/package-lock.json', import.meta.url)));
   const dataPort = await port(), adminPort = await port(), publicPort = await port(), upstreamPort = await port();
   const origin = `http://127.0.0.1:${dataPort}`, adminOrigin = `http://127.0.0.1:${adminPort}`, publicOrigin = `http://127.0.0.1:${publicPort}`;
   const upstreamRequests = []; let cancelled = false;
@@ -127,5 +129,6 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const freshPublic = browser(publicOrigin); assert.deepEqual(JSON.parse((await freshPublic.request('/status')).text), { state: 'idle' });
   assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key|private-trailer/);
   await stop();
+  await assert.rejects(access(join(dataDir, 'codex'))); // Explicit fixture override must never install the real CLI.
   t.diagnostic(`Verified actual CLI install at ${ref}; two restarts, opaque SSE, cancellation, scoped credentials, managed GET fallback.`);
 });

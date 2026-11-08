@@ -1,7 +1,11 @@
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { CodexInstallation } from './codex-install.mjs';
 import { Fault, object, credential } from './model.mjs';
+// No credential-bearing runtime was created; retrying the original credential is safe.
+export class ProviderAdmissionFault extends Fault {
+}
 class Runtime {
     home;
     next = 0;
@@ -130,23 +134,32 @@ export class CodexProvider {
     stopped = false;
     shutdown = new AbortController();
     operations = new Set();
+    installation;
     constructor(dir, command, max = 4) {
         this.dir = dir;
         this.command = command;
         this.max = max;
+        if (command === undefined)
+            this.installation = new CodexInstallation(join(dirname(dir), 'codex'));
+    }
+    prepare(signal = this.shutdown.signal) {
+        if (this.stopped || signal.aborted)
+            return Promise.reject(new ProviderAdmissionFault('CANCELLED', 499));
+        return this.command !== undefined ? Promise.resolve(this.command) : this.installation.prepare(AbortSignal.any([signal, this.shutdown.signal]));
     }
     async run(signal, saved, waiting) {
         if (this.stopped || signal.aborted)
-            throw new Fault('CANCELLED', 499);
+            throw new ProviderAdmissionFault('CANCELLED', 499);
         // Reserve before the first await to bound concurrent creation too.
         // Public device logins leave one slot for credential refresh (when capacity permits).
         if (this.reserved >= (saved ? this.max : Math.max(1, this.max - 1)))
-            throw new Fault('PROVIDER_BUSY', 429);
+            throw new ProviderAdmissionFault('PROVIDER_BUSY', 429);
         this.reserved++;
         let home, runtime, loginTimer;
         const expiry = new AbortController();
         signal = AbortSignal.any([signal, expiry.signal]);
         try {
+            const command = await this.prepare(signal);
             await mkdir(this.dir, { recursive: true, mode: 0o700 });
             home = await mkdtemp(join(this.dir, 'run-'));
             await mkdir(join(home, 'tmp'), { mode: 0o700 });
@@ -154,7 +167,7 @@ export class CodexProvider {
                 await writeFile(join(home, 'auth.json'), JSON.stringify(saved.auth), { mode: 0o600 });
             if (this.stopped || signal.aborted)
                 throw new Fault('CANCELLED', 499);
-            runtime = new Runtime(this.command, home, signal);
+            runtime = new Runtime(command, home, signal);
             this.active.add(runtime);
             await runtime.initialize();
             if (!saved) {
@@ -194,7 +207,8 @@ export class CodexProvider {
             return { credential: credential(JSON.parse(raw.toString())), identity: account.email.trim().toLowerCase(), usage };
         }
         catch (e) {
-            throw expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED');
+            const error = expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED');
+            throw runtime?.child.pid ? error : new ProviderAdmissionFault(error.code, error.status);
         }
         finally {
             clearTimeout(loginTimer);
@@ -219,7 +233,7 @@ export class CodexProvider {
     async close() {
         this.stopped = true;
         this.shutdown.abort();
-        await Promise.all([...this.active].map(r => r.stop()));
+        await Promise.all([this.installation?.close(), ...[...this.active].map(r => r.stop())]);
         await Promise.allSettled([...this.operations]);
     }
 }

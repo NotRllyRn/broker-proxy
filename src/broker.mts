@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store.mjs';
 import { Fault, digest, credential, labels, text, publicAccount, type Account, type Caller, type Credential } from './model.mjs';
 import { candidates, retryAt, exclude, applyQuota, normalizeUsage, inScope, exhausted } from './policy.mjs';
-import type { Provider, Device } from './provider.mjs';
+import { ProviderAdmissionFault, type Provider, type Device } from './provider.mjs';
 
 export type Enrollment = { id: string; state: 'starting' | 'waiting' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'expired'; expires: number; device?: Device; error?: string };
 export class Broker {
@@ -72,13 +72,16 @@ export class Broker {
   }
   private async refreshAccount(id: string) {
     const startedAt = this.clock();
+    const signal = AbortSignal.any([this.stop.signal, AbortSignal.timeout(25000)]);
+    // Installation cannot rotate credentials: do not persist an ambiguous refresh while waiting for it.
+    await this.provider.prepare?.(signal);
     const original = await this.store.change(s => {
       const a = s.accounts.find(a => a.id === id); if (!a) throw new Fault('NOT_FOUND', 404);
       if (a.authState === 'required') throw new Fault('AUTH_REQUIRED', 409);
       a.authState = 'refreshing'; return structuredClone(a.credential);
     });
     try {
-      const result = await this.provider.refresh(original, AbortSignal.any([this.stop.signal, AbortSignal.timeout(25000)]));
+      const result = await this.provider.refresh(original, signal);
       if (result.credential.accountId !== original.accountId) throw new Fault('IDENTITY_CHANGED');
       await this.store.change(s => {
         const a = s.accounts.find(a => a.id === id);
@@ -91,8 +94,8 @@ export class Broker {
         const a = s.accounts.find(a => a.id === id);
         if (!a || a.credential.accessToken !== original.accessToken || a.authState !== 'refreshing') return;
         // Admission rejection cannot have rotated credentials; ambiguous provider failures can.
-        const busy = e instanceof Fault && e.code === 'PROVIDER_BUSY';
-        a.authState = busy ? 'verified' : 'required'; a.lastError = busy ? 'PROVIDER_BUSY' : 'REFRESH_FAILED';
+        const admission = e instanceof ProviderAdmissionFault || e instanceof Fault && e.code === 'PROVIDER_BUSY';
+        a.authState = admission ? 'verified' : 'required'; a.lastError = admission ? e.code : 'REFRESH_FAILED';
       });
       throw e instanceof Fault ? e : new Fault('REFRESH_FAILED');
     }

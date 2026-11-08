@@ -1,11 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { CodexInstallation } from './codex-install.mjs';
 import { Fault, object, credential, type Credential } from './model.mjs';
+
+// No credential-bearing runtime was created; retrying the original credential is safe.
+export class ProviderAdmissionFault extends Fault {}
 
 export type Device = { loginId: string; url: string; code: string; expiresAt?: number };
 export type ProviderResult = { credential: Credential; identity: string; usage: unknown };
 export interface Provider {
+  prepare?(signal: AbortSignal): Promise<unknown>;
   login(signal: AbortSignal, waiting: (device: Device) => void): Promise<ProviderResult>;
   refresh(saved: Credential, signal: AbortSignal): Promise<ProviderResult>;
   close(): Promise<void>;
@@ -98,23 +103,31 @@ export class CodexProvider implements Provider {
   private stopped = false;
   private shutdown = new AbortController();
   private operations = new Set<Promise<ProviderResult>>();
-  constructor(private dir: string, private command: string, private max = 4) {}
+  private installation: CodexInstallation | undefined;
+  constructor(private dir: string, private command?: string, private max = 4) {
+    if (command === undefined) this.installation = new CodexInstallation(join(dirname(dir), 'codex'));
+  }
+  prepare(signal = this.shutdown.signal): Promise<string> {
+    if (this.stopped || signal.aborted) return Promise.reject(new ProviderAdmissionFault('CANCELLED', 499));
+    return this.command !== undefined ? Promise.resolve(this.command) : this.installation!.prepare(AbortSignal.any([signal, this.shutdown.signal]));
+  }
   private async run(signal: AbortSignal, saved: Credential | null, waiting?: (device: Device) => void): Promise<ProviderResult> {
-    if (this.stopped || signal.aborted) throw new Fault('CANCELLED', 499);
+    if (this.stopped || signal.aborted) throw new ProviderAdmissionFault('CANCELLED', 499);
     // Reserve before the first await to bound concurrent creation too.
     // Public device logins leave one slot for credential refresh (when capacity permits).
-    if (this.reserved >= (saved ? this.max : Math.max(1, this.max - 1))) throw new Fault('PROVIDER_BUSY', 429);
+    if (this.reserved >= (saved ? this.max : Math.max(1, this.max - 1))) throw new ProviderAdmissionFault('PROVIDER_BUSY', 429);
     this.reserved++;
     let home: string | undefined, runtime: Runtime | undefined, loginTimer: NodeJS.Timeout | undefined;
     const expiry = new AbortController();
     signal = AbortSignal.any([signal, expiry.signal]);
     try {
+      const command = await this.prepare(signal);
       await mkdir(this.dir, { recursive: true, mode: 0o700 });
       home = await mkdtemp(join(this.dir, 'run-'));
       await mkdir(join(home, 'tmp'), { mode: 0o700 });
       if (saved) await writeFile(join(home, 'auth.json'), JSON.stringify(saved.auth), { mode: 0o600 });
       if (this.stopped || signal.aborted) throw new Fault('CANCELLED', 499);
-      runtime = new Runtime(this.command, home, signal); this.active.add(runtime);
+      runtime = new Runtime(command, home, signal); this.active.add(runtime);
       await runtime.initialize();
       if (!saved) {
         const completed = runtime.completion(signal);
@@ -141,7 +154,10 @@ export class CodexProvider implements Provider {
       const raw = await readFile(join(home, 'auth.json'));
       if (raw.length > 256 * 1024) throw new Fault('INVALID_CREDENTIAL');
       return { credential: credential(JSON.parse(raw.toString())), identity: account.email.trim().toLowerCase(), usage };
-    } catch (e) { throw expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED'); }
+    } catch (e) {
+      const error = expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED');
+      throw runtime?.child.pid ? error : new ProviderAdmissionFault(error.code, error.status);
+    }
     finally {
       clearTimeout(loginTimer);
       if (runtime) { await runtime.stop(); this.active.delete(runtime); }
@@ -160,7 +176,7 @@ export class CodexProvider implements Provider {
   refresh(saved: Credential, signal: AbortSignal) { return this.operation(signal, saved); }
   async close() {
     this.stopped = true; this.shutdown.abort();
-    await Promise.all([...this.active].map(r => r.stop()));
+    await Promise.all([this.installation?.close(), ...[...this.active].map(r => r.stop())]);
     await Promise.allSettled([...this.operations]);
   }
 }
