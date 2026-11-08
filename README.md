@@ -11,20 +11,24 @@ A real TypeScript account-brokering extension for [ProxyKit](https://github.com/
 
 ## Build and test
 
-Build against the actual ProxyKit SDK, not a vendored imitation. `PROXYKIT_SOURCE` defaults to `/code/proxykit`. **This version requires the small host correction `ade6cc9`**, committed locally in that checkout but not pushed to ProxyKit's remote. It exposes declared trailer presence to Node; older hosts fail closed. The public baseline alone is insufficient. See [status](docs/STATUS.md) before using another ProxyKit checkout.
+Source, SDK and host binary compatibility are pinned to published ProxyKit **`07a8cd010fc171a0d1cb9c5254ccbfee5714e536`** ([source](https://github.com/NotRllyRn/proxykit/tree/07a8cd010fc171a0d1cb9c5254ccbfee5714e536)). It includes trailer visibility (`ade6cc9`), hot activation and the CLI shutdown store-lock fix (`ae061aa`); **no private host patch is required**. Build against that actual SDK, not a vendored imitation. `PROXYKIT_SOURCE` defaults to `/code/proxykit`; explicitly select a clean pinned archive if that shared checkout differs. Manifest `apiVersion: 1` is required independently of `manifestVersion: 1`.
 
 ```sh
 cd /code/broker-proxy
+# Read-only use of the shared repository; never reset/clean its active checkout.
+export PROXYKIT_REV=07a8cd010fc171a0d1cb9c5254ccbfee5714e536
+export PROXYKIT_SOURCE="$(mktemp -d /tmp/broker-proxykit-source-XXXXXX)"
+git -C /code/proxykit archive "$PROXYKIT_REV" | tar -x -C "$PROXYKIT_SOURCE"
+export PROXYKIT_BINARY=/tmp/broker-proxy-proxykit
+(cd "$PROXYKIT_SOURCE" && go build -o "$PROXYKIT_BINARY" ./cmd/proxykit)
 npm ci
 npm test
 # Optional network test: real pinned CLI install/version/schema/initialize, no account or login.
 npm run test:codex
-# See docs/STATUS.md for the required host bridge revision.
-(cd /code/proxykit && go build -o /tmp/broker-proxy-proxykit ./cmd/proxykit)
 npm run test:system
 ```
 
-`npm test` runs deterministic policy, persistence, provider-process and real web-listener tests. `test:system` uses the **actual CLI GitHub installer**, then the compiled Go proxy and installed Node worker against a local upstream. It needs network access and the tested commit pushed to GitHub. It does not substitute a mocked installer or a local copy. Override `PROXYKIT_BINARY` and `BROKER_TEST_REF` if needed; the default reference is this checkout's `HEAD`. Builds are committed for installation; `npm run build` checks/regenerates them.
+`npm test` runs deterministic policy, persistence, provider-process and real web-listener tests. `test:system` uses the **actual CLI GitHub installer for the broker**, explicitly enables it offline, then runs the compiled Go proxy and installed Node worker against a synthetic upstream/provider. It needs network access and the tested commit pushed to GitHub. Only an unrelated response-header fixture uses the real Installer with controlled archive transport; its Go dependency is pinned to the same published host revision in `test/activation-fixture/go.mod` (no local replacement). Live enable/disable must preserve the broker PID, both listener sockets, locks, admin session and account/pulse state; shutdown must release listeners, worker and locks. These system assertions require **Linux `/proc`, `flock` and Go >=1.26** (other platforms skip this test). Override `PROXYKIT_BINARY` and `BROKER_TEST_REF` if needed; the default reference is this checkout's full `HEAD`. Builds are committed for installation; `npm run build` checks/regenerates them. See [exact verification evidence](docs/STATUS.md).
 
 ## Guided local demonstration — fixtures only
 
@@ -32,7 +36,7 @@ npm run test:system
 npm run demo
 ```
 
-The script installs this commit through ProxyKit's CLI into a disposable extension directory, seeds synthetic credentials, starts a **mock upstream**, then starts ProxyKit with both web services. Nothing calls a live provider. Synthetic demo values are deliberately public:
+The script installs this commit through ProxyKit's CLI into a disposable extension directory, explicitly enables `broker-proxy` offline, seeds synthetic credentials, starts a **mock upstream**, then starts ProxyKit with both web services. Nothing calls a live provider. Synthetic demo values are deliberately public:
 
 1. Open **http://127.0.0.1:8788**, sign in with `fixture-demo-admin`. Inspect stored quota/freshness, per-account counters and pulse status. **Refresh quota** does not send inference; **Pulse (uses inference)** runs a synthetic account-specific turn. Enable automatic pulses in the small settings form to schedule initial/window pulses; use a newly enrolled fixture account to see an initial scheduled pulse without waiting for a future reset. The fixture does not contact OpenAI. Disable automatic pulses again to demonstrate durable settings.
 2. Open **http://127.0.0.1:8789**, start device enrollment. It auto-completes after a short fixture delay. **Do not enter the fixture code at OpenAI.** A repeated enrollment is rejected as a duplicate.
@@ -60,10 +64,15 @@ node scripts/init.mjs /absolute/new/private-broker
 # Pin a reviewed revision when installing; no npm package is required.
 proxykit extension install https://github.com/NotRllyRn/broker-proxy --trust
 
-# Restart activates extensions. The environment variable must reach the Node worker.
+# Install persists DISABLED. Enable offline before starting the server.
+proxykit extension enable broker-proxy
+
+# The environment variable must reach the Node worker.
 BROKER_CONFIG=/absolute/new/private-broker/config.json \
   proxykit -listen 127.0.0.1:8080 -upstream https://chatgpt.com -node "$(command -v node)"
 ```
+
+Use the same `PROXYKIT_EXTENSIONS_DIR` for installation, management and serving. On an **already running** server configured with `BROKER_CONFIG`, `proxykit extension enable broker-proxy` activates without restarting; alternatively `extension install URL --trust --activate` installs and enables online. `--activate` requires a running server: offline it returns an error and leaves the package installed but disabled. `extension status broker-proxy` separates persisted enabled intent from runtime status. For code replacement, disable → wait for drain/cleanup/reaping → remove → install the reviewed revision → enable; never overlap stateful owners or edit host installation files. See the pinned [activation contract](https://github.com/NotRllyRn/proxykit/blob/07a8cd010fc171a0d1cb9c5254ccbfee5714e536/docs/HOT_ACTIVATION.md).
 
 Read `secrets.json` privately: `admin` signs into the dashboard; `caller` is the data-plane bearer token. The initializer never prints either. Store this file securely or move its contents to your secret manager; never commit it. The application's state holds only digests for caller/admin authentication, but provider credentials necessarily remain in its private state file.
 
@@ -76,7 +85,7 @@ The broker manages **official `@openai/codex@0.167.0`** by default; the server d
 - **Private storage:** `dataDir/codex/` contains `current/`, disposable `staging/`, npm `cache/` and an isolated installer `home/`. The private parent is 0700; no runtime artifact is written into the extension/repository or another Codex home. On Linux x64, the observed installed tree is ~438 MiB plus ~166 MiB cache; allow at least 1 GiB free for installation/repair. Credentials are confined to the existing private store and per-operation `runtimes/`, not used during installation.
 - **Reuse/recovery:** installation is single-flight within the provider, under the existing exclusive data-directory store lock. A completed staging tree is atomically renamed only after version validation and a SHA-256 tree digest. On each worker startup, reuse checks the pin/lock identity, file contents/modes/symlink targets and binary version. Partial/corrupt installations are removed and rebuilt; npm also verifies cached downloads. The marker detects accidental corruption, not malicious changes by the same OS user. No shared/multi-process cache claim.
 - **Network and lifecycle:** first startup/repair needs direct HTTPS/DNS access to `registry.npmjs.org`. npm user/global configuration and credentials are not inherited; custom registries/proxy configuration are not supported. Later provider login/refresh/quota calls independently need provider network access. Preparation starts in the background because ProxyKit setup has a 10-second deadline; listeners can be ready before Codex is ready. Provider operations await preparation. A refresh's existing 25-second deadline may expire during a cold install without quarantining its credential; background preparation continues. Installation is bounded to 180 seconds, npm-availability/CLI-version probes to 10 seconds, and diagnostics to 64 KiB. Cancellation of the last waiter or graceful shutdown terminates the installer process group (SIGTERM, then SIGKILL after 500 ms) and removes staging. Startup failures log a sanitized `CODEX_*` code; later operations can retry, never change the pin.
-- **Upgrades/limits:** upgrade the pin by reviewing/updating the committed manifest/lock and `CODEX_VERSION`, regenerating the build and rerunning tests; install a reviewed broker revision and restart. Stop the instance before manually clearing its `codex/` cache. After a hard crash, verify **all** directory-using processes, including npm children, have stopped before clearing the stale store lock; a completion marker is not a transactional/fsync durability promise. Regular tests, system tests and the demo use explicit fixtures and do not download Codex. `npm run test:codex` is the separate real download/initialize probe, **not** provider-account verification.
+- **Upgrades/limits:** upgrade the pin by reviewing/updating the committed manifest/lock and `CODEX_VERSION`, regenerating the build and rerunning tests; replace the broker with a reviewed revision using the disable/drain/remove/install/enable sequence above. Stop the instance before manually clearing its `codex/` cache. After a hard crash, verify **all** directory-using processes, including npm children, have stopped before clearing the stale store lock; a completion marker is not a transactional/fsync durability promise. Regular tests, system tests and the demo use explicit fixtures and do not download Codex. `npm run test:codex` is the separate real download/initialize probe, **not** provider-account verification.
 
 ### Configuration
 

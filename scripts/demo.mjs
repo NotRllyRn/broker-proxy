@@ -46,6 +46,7 @@ const upstream = createServer(async (req, res) => {
 let child;
 try {
   await exec(binary, ['extension', 'install', `https://github.com/NotRllyRn/broker-proxy/tree/${ref}`, '--trust'], { env });
+  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env }); // Offline persisted intent; install alone is disabled.
   await new Promise((resolve, reject) => upstream.once('error', reject).listen(upstreamPort, '127.0.0.1', resolve));
   child = spawn(binary, ['-listen', `127.0.0.1:${dataPort}`, '-upstream', `http://127.0.0.1:${upstreamPort}`, '-node', process.execPath], { env, stdio: 'inherit' });
   const stop = () => child.kill('SIGTERM');

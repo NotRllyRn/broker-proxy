@@ -102,6 +102,14 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 - Scheduling defaults **OFF**; enabled mode seeds accounts then uses confirmed short/weekly provider resets. The durable inference dispatch boundary consumes its trigger even on ambiguity; confirmation reads do not blindly replay inference. Original full cycle/rolling-idle/first-four/daily policies remain omitted as planned. README describes deadlines, spacing, backoff, quarantine recovery and the runnable fixture demo.
 - Extended the real GitHub-installed system test to cover manual and automatic fixture pulses, settings, per-account stats and durable restart. Exact published-runtime/test evidence is recorded in STATUS after that network installation test.
 
+## Companion migration: published ProxyKit hot activation (plan before edits)
+
+- Verified remote `main` is `07a8cd010fc171a0d1cb9c5254ccbfee5714e536`, containing trailer fix `ade6cc9`, hot activation through `462c39b`, and CLI shutdown ownership fix `ae061aa`. Read the full authoring, hot-activation and verification guides. Shared `/code/proxykit` is clean at that pin; leave it untouched and build/test from a disposable pinned archive.
+- Add required `apiVersion: 1` independently of `manifestVersion`. Explicitly enable the disabled installation before startup in the system harness/demo and operator instructions; explain online enable/`--activate`. No broker application or pulse rewrites.
+- Pin source/SDK/binary documentation and the small real-Installer test dependency to that published revision. Install the broker candidate from its actual pushed GitHub commit; install only an unrelated response-header fixture through controlled archive transport. Reuse the compatibility probe's observable Linux PID/listener/lock checks, not its synthetic broker revision or patched archive.
+- Assert live unrelated enable/disable toggles headers without changing broker PID, either listener socket, lock, authenticated admin session or account/pulse state. Check shutdown listener/process cleanup and both broker lock removal and host OS lock release. Retain trailer rejection and existing pulse/restart coverage.
+- Preserve the pending pulse evidence after checking `/tmp/broker-pulse-system.log`. Run build/unit tests, the real pinned Codex schema/initialize probe (no account), repeated actual installed-system tests and demo smoke at the published candidate. Commit/push the minimal migration, then record exact evidence in a documentation commit; distinguish controlled fixtures from real GitHub downloads and live-provider verification.
+
 ## Uncertainties to resolve honestly
 
 - No live provider login/refresh/quota verification without operator-authorized private credential entry. Local app-server fixture is not real provider certification.

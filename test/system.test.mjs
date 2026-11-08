@@ -5,14 +5,14 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createServer, request as httpRequest } from 'node:http';
 import { join } from 'node:path';
-import { readFile, writeFile, rm, access } from 'node:fs/promises';
+import { readFile, writeFile, rm, access, readdir, readlink, stat } from 'node:fs/promises';
 import { Store } from '../build/store.mjs';
 import { Broker } from '../build/broker.mjs';
 import { digest } from '../build/model.mjs';
 import { temp, port, auth, browser, until, fixtureCommand, delay } from './helpers.mjs';
 const exec = promisify(execFile);
 
-test('real GitHub CLI installation → compiled ProxyKit → installed Node worker → upstream; lifecycle and managed fallback', { timeout: 120000 }, async t => {
+test('real GitHub CLI installation → compiled ProxyKit → installed Node worker → upstream; hot activation and lifecycle', { timeout: 180000, skip: process.platform !== 'linux' && 'Linux /proc and flock assertions' }, async t => {
   const dir = await temp(), dataDir = join(dir, 'data');
   const binary = process.env.PROXYKIT_BINARY || '/tmp/broker-proxy-proxykit';
   const ref = process.env.BROKER_TEST_REF || (await exec('git', ['rev-parse', 'HEAD'])).stdout.trim();
@@ -20,9 +20,16 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const installed = await exec(binary, ['extension', 'install', `https://github.com/NotRllyRn/broker-proxy/tree/${ref}`, '--trust'], { env });
   assert.match(installed.stdout + installed.stderr, /Installed broker-proxy/);
   const installation = JSON.parse(await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'installation.json')));
-  assert.ok(JSON.stringify(installation).includes(ref));
+  assert.equal(installation.commit, ref);
+  assert.deepEqual(installation.manifest, JSON.parse(await readFile(new URL('../proxykit-extension.json', import.meta.url))));
   const shippedLock = await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'package', 'codex', 'package-lock.json'));
   assert.deepEqual(shippedLock, await readFile(new URL('../codex/package-lock.json', import.meta.url)));
+  const offline = await exec(binary, ['extension', 'status', 'broker-proxy'], { env });
+  assert.match(offline.stdout, /broker-proxy\s+0\.1\.0\s+1\s+true\s+false\s+unknown/);
+  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env }); // Persist intent before startup.
+  // Only this unrelated synthetic extension uses controlled archive transport, never the broker.
+  await exec('go', ['run', '.'], { cwd: new URL('./activation-fixture/', import.meta.url), env });
+  const ownerLock = join(env.PROXYKIT_EXTENSIONS_DIR, '.owner-lock');
   const dataPort = await port(), adminPort = await port(), publicPort = await port(), upstreamPort = await port();
   const origin = `http://127.0.0.1:${dataPort}`, adminOrigin = `http://127.0.0.1:${adminPort}`, publicOrigin = `http://127.0.0.1:${publicPort}`;
   const upstreamRequests = []; let cancelled = false;
@@ -55,7 +62,7 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   await seed.close();
   await writeFile(env.BROKER_CONFIG, JSON.stringify({ dataDir, adminHash: digest('fixture-admin-secret'), upstream: `http://127.0.0.1:${upstreamPort}/backend`,
     dashboard: { port: adminPort }, enrollment: { port: publicPort }, codexCommand: await fixtureCommand(dir), pollMs: 0, safeFallback: true }), { mode: 0o600 });
-  let child, logs = '';
+  let child, workerPid, logs = '';
   const start = async () => {
     child = spawn(binary, ['-listen', `127.0.0.1:${dataPort}`, '-upstream', `http://127.0.0.1:${upstreamPort}`, '-node', process.execPath], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', b => logs += b); child.stderr.on('data', b => logs += b);
@@ -63,6 +70,9 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
       if (child.exitCode !== null) throw Error('ProxyKit exited: ' + logs);
       try { return (await fetch(adminOrigin)).status === 200; } catch { return false; }
     }, 15000);
+    workerPid = Number(await readFile(join(dataDir, 'lock'), 'utf8'));
+    assert.ok(workerPid > 0);
+    await assert.rejects(exec('flock', ['-n', ownerLock, 'true']), { code: 1 });
   };
   const stop = async () => {
     if (!child || child.exitCode !== null) return;
@@ -70,6 +80,10 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
     const kill = setTimeout(() => child.kill('SIGKILL'), 7000);
     const [code, signal] = await exited; clearTimeout(kill);
     assert.equal(signal, null, logs); assert.equal(code, 0, logs);
+    await assert.rejects(access(join(dataDir, 'lock')));
+    await assert.rejects(access(`/proc/${workerPid}`));
+    for (const url of [adminOrigin, publicOrigin, origin]) await assert.rejects(fetch(url));
+    await exec('flock', ['-n', ownerLock, 'true']); // OS lock released, not merely a surviving lock-file inode.
   };
   t.after(async () => { await stop(); upstream.closeAllConnections(); await new Promise(r => upstream.close(r)); await rm(dir, { recursive: true, force: true }); });
   await start();
@@ -130,6 +144,38 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   }, 35000);
   assert.equal((await admin.request('/settings/pulses', { spacingSeconds: '60' })).status, 303);
   assert.doesNotMatch(JSON.stringify(pulses), /fixture-rotated|access_token|refresh_token/);
+  // Unrelated live publication must not rerun stateful broker setup or rebind either listener.
+  const resources = async () => {
+    const pid = Number(await readFile(join(dataDir, 'lock'), 'utf8'));
+    const entries = (await readFile('/proc/net/tcp', 'utf8')).trim().split('\n').slice(1).map(line => line.trim().split(/\s+/));
+    const ports = [adminPort, publicPort].map(p => p.toString(16).toUpperCase().padStart(4, '0'));
+    const listeners = entries.filter(e => e[3] === '0A' && ports.includes(e[1].split(':')[1])).map(e => e[9]).sort();
+    assert.equal(listeners.length, 2);
+    const fds = await Promise.all((await readdir(`/proc/${pid}/fd`)).map(fd => readlink(`/proc/${pid}/fd/${fd}`).catch(() => '')));
+    for (const inode of listeners) assert.ok(fds.includes(`socket:[${inode}]`), 'broker owns both listener sockets');
+    await assert.rejects(exec('flock', ['-n', ownerLock, 'true']), { code: 1 });
+    return { pid, listeners, lock: (await stat(join(dataDir, 'lock'))).ino, ownerLock: (await stat(ownerLock)).ino };
+  };
+  const originalResources = await resources();
+  const headerProbe = async enabled => {
+    const probe = await request('/v1/models', scoped);
+    assert.equal(probe.status, 200); assert.equal(probe.headers.get('x-activation-fixture'), enabled ? 'enabled' : null);
+    await probe.text();
+  };
+  await headerProbe(false);
+  for (const enabled of [true, false]) {
+    const beforeActivation = JSON.parse((await admin.request('/api/status')).text);
+    await exec(binary, ['extension', enabled ? 'enable' : 'disable', 'activation-fixture'], { env });
+    assert.deepEqual(await resources(), originalResources, 'same worker, listener sockets and locks');
+    const session = await admin.request('/api/status');
+    assert.equal(session.status, 200, 'same authenticated in-memory admin session');
+    const afterActivation = JSON.parse(session.text);
+    assert.deepEqual(afterActivation.accounts, beforeActivation.accounts, 'account and pulse state unchanged');
+    assert.deepEqual(afterActivation.pulseSettings, beforeActivation.pulseSettings);
+    assert.equal((await fetch(publicOrigin)).status, 200);
+    await headerProbe(enabled);
+  }
+  t.diagnostic('Unrelated live enable/disable: header toggles; broker PID, both listener sockets, locks, admin session and account/pulse state preserved.');
   const publicBrowser = browser(publicOrigin); await publicBrowser.request(); await publicBrowser.request('/start', {});
   await until(async () => JSON.parse((await publicBrowser.request('/status')).text).state === 'completed');
   await admin.request('/account/state', { id: a, enabled: 'false' });
@@ -147,5 +193,5 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key|private-trailer/);
   await stop();
   await assert.rejects(access(join(dataDir, 'codex'))); // Explicit fixture override must never install the real CLI.
-  t.diagnostic(`Verified actual CLI install at ${ref}; two restarts, opaque SSE, cancellation, scoped credentials, managed GET fallback; manual and background scheduled account pulses/settings/stats with isolated app-server fixture (not live-provider verification).`);
+  t.diagnostic(`Verified actual GitHub CLI install at ${ref}; two boots, declared trailers rejected, opaque SSE, cancellation, scoped credentials, managed safe-method fallback; manual/background pulses/settings/stats, restart and final process/listener/lock cleanup. Only unrelated header installation uses controlled archive transport; upstream/app-server are synthetic, not live-provider verification.`);
 });
