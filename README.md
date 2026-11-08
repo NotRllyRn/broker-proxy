@@ -7,7 +7,7 @@ A real TypeScript account-brokering extension for [ProxyKit](https://github.com/
 - ProxyKit keeps its existing inference listener and Go transport. This package does not implement a second inference proxy.
 - Dashboard defaults to `http://127.0.0.1:8788`; public enrollment defaults to `http://127.0.0.1:8789`.
 - Selection follows Codex Broker's **cycle-disabled** rules, not a percentage score or full production-cycle port.
-- Dependency-free runtime; Node **24+**. TypeScript and Node declarations are development dependencies only.
+- Dependency-free JavaScript runtime; Node **24+**. The broker installs its own pinned official Codex CLI using **npm 10+**, not a globally installed `codex`. TypeScript and Node declarations are development dependencies only.
 
 ## Build and test
 
@@ -17,6 +17,8 @@ Build against the actual ProxyKit SDK, not a vendored imitation. `PROXYKIT_SOURC
 cd /code/broker-proxy
 npm ci
 npm test
+# Optional network test: real pinned CLI install/version/schema/initialize, no account or login.
+npm run test:codex
 # See docs/STATUS.md for the required host bridge revision.
 (cd /code/proxykit && go build -o /tmp/broker-proxy-proxykit ./cmd/proxykit)
 npm run test:system
@@ -65,7 +67,16 @@ BROKER_CONFIG=/absolute/new/private-broker/config.json \
 
 Read `secrets.json` privately: `admin` signs into the dashboard; `caller` is the data-plane bearer token. The initializer never prints either. Store this file securely or move its contents to your secret manager; never commit it. The application's state holds only digests for caller/admin authentication, but provider credentials necessarily remain in its private state file.
 
-The device flow requires a trusted `codex` executable implementing the inspected app-server protocol. Set `codexCommand` to its absolute path if it is not on PATH. Each operation receives an isolated `HOME`/`CODEX_HOME`, not your normal Codex credentials. Public enrollment requests a provider device code, waits for the matching completion, reads the ChatGPT identity/credential and quota, then commits before activating. It never accepts credentials or administrator privileges from a public form. Protected manual `auth.json` import is a separate dashboard operation, also useful for reauthorizing quarantined accounts.
+The broker manages **official `@openai/codex@0.167.0`** by default; the server does **not** need Codex CLI preinstalled. See the installation details below. An explicit `codexCommand` overrides managed installation entirely for fixtures or deliberate operator use (an executable path/name, never a shell command). Existing configurations containing `"codexCommand":"codex"` still explicitly opt into PATH lookup; **remove that key** to use the managed pin. Each operation receives an isolated `HOME`/`CODEX_HOME`, not your normal Codex credentials. Public enrollment requests a provider device code, waits for the matching completion, reads the ChatGPT identity/credential and quota, then commits before activating. It never accepts credentials or administrator privileges from a public form. Protected manual `auth.json` import is a separate dashboard operation, also useful for reauthorizing quarantined accounts.
+
+### Managed Codex installation
+
+- **Prerequisites:** Node 24+ for the extension, trusted npm 10+ on PATH for an initial install/repair, and Linux or macOS on x64/arm64. Only Linux x64 is real-binary tested here; Windows and other targets fail explicitly. The broker does not install Node/npm. Verified cache reuse does not require npm or registry access. No global install, `npx`, floating version, auto-update or fallback to global Codex occurs.
+- **Pin/integrity:** committed `codex/package.json` and npm v3 `codex/package-lock.json` pin the official wrapper and six platform artifacts to 0.167.0, with official HTTPS tarball URLs and SHA-512 integrity. Private `npm ci --ignore-scripts --include=optional` performs locked installation/integrity verification. The matching native binary is invoked directly (layout verified against the pinned official launcher); its `--version` must be exactly `codex-cli 0.167.0`.
+- **Private storage:** `dataDir/codex/` contains `current/`, disposable `staging/`, npm `cache/` and an isolated installer `home/`. The private parent is 0700; no runtime artifact is written into the extension/repository or another Codex home. On Linux x64, the observed installed tree is ~438 MiB plus ~166 MiB cache; allow at least 1 GiB free for installation/repair. Credentials are confined to the existing private store and per-operation `runtimes/`, not used during installation.
+- **Reuse/recovery:** installation is single-flight within the provider, under the existing exclusive data-directory store lock. A completed staging tree is atomically renamed only after version validation and a SHA-256 tree digest. On each worker startup, reuse checks the pin/lock identity, file contents/modes/symlink targets and binary version. Partial/corrupt installations are removed and rebuilt; npm also verifies cached downloads. The marker detects accidental corruption, not malicious changes by the same OS user. No shared/multi-process cache claim.
+- **Network and lifecycle:** first startup/repair needs direct HTTPS/DNS access to `registry.npmjs.org`. npm user/global configuration and credentials are not inherited; custom registries/proxy configuration are not supported. Later provider login/refresh/quota calls independently need provider network access. Preparation starts in the background because ProxyKit setup has a 10-second deadline; listeners can be ready before Codex is ready. Provider operations await preparation. A refresh's existing 25-second deadline may expire during a cold install without quarantining its credential; background preparation continues. Installation is bounded to 180 seconds, npm-availability/CLI-version probes to 10 seconds, and diagnostics to 64 KiB. Cancellation of the last waiter or graceful shutdown terminates the installer process group (SIGTERM, then SIGKILL after 500 ms) and removes staging. Startup failures log a sanitized `CODEX_*` code; later operations can retry, never change the pin.
+- **Upgrades/limits:** upgrade the pin by reviewing/updating the committed manifest/lock and `CODEX_VERSION`, regenerating the build and rerunning tests; install a reviewed broker revision and restart. Stop the instance before manually clearing its `codex/` cache. After a hard crash, verify **all** directory-using processes, including npm children, have stopped before clearing the stale store lock; a completion marker is not a transactional/fsync durability promise. Regular tests, system tests and the demo use explicit fixtures and do not download Codex. `npm run test:codex` is the separate real download/initialize probe, **not** provider-account verification.
 
 ### Configuration
 
@@ -79,7 +90,7 @@ The device flow requires a trusted `codex` executable implementing the inspected
 | `enrollment` | `{ "host": "127.0.0.1", "port": 8789 }`; distinct port and origin |
 | `enrollmentLabels` | `["Personal usage"]`; assigned by operator, never public visitor |
 | `upstream` | `https://chatgpt.com/backend-api/codex`; fixed trusted origin/base path |
-| `codexCommand` | `codex`; executable path, not a shell command or argument string |
+| `codexCommand` | Omitted: broker-managed **0.167.0**; explicit executable path/name bypasses installation and version checks |
 | `pollMs` | `90000`; one sequential account refresh per tick; `0` disables; otherwise 45,000–86,400,000 |
 | `safeFallback` | `false`; opt-in narrow managed safe-method fallback, described below |
 

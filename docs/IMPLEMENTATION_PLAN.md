@@ -80,6 +80,11 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 - Add fixture coverage for exact lock/pin, reuse, corruption/partial/failing install, single flight, cancellation/shutdown and override bypass. Demo/system fixtures must not install real Codex. Run full unit suite, a separate real isolated install/version/initialize probe without accounts, then push broker commits before the actual GitHub-installed system test. Leave `/code/proxykit` (local host fix `ade6cc9`) and production unchanged.
 - Update README/STATUS with exact pin, prerequisites/network and disk needs, upgrade procedure and honest verification limits. No usage pulses or inference-loop changes.
 
+### Follow-up execution checkpoint
+
+- Exact official `@openai/codex@0.167.0` selected and verified; manifest/lock and compiled installer committed in runtime revision `569c858`. Default private installation, explicit override, background startup, cancellation/cleanup and pre-runtime refresh safety implemented. No host/production changes and no usage pulses.
+- **50 fixture/regression tests**, **1 real isolated install/version/schema/initialize test** (Linux x64, no account), and **1 actual GitHub-installed system test** at pushed `569c858` passed. System fixtures bypass real installation and verify the shipped lock. See STATUS.md/README.md for prerequisites, private disk/network needs and remaining live-provider verification limits.
+
 ## Uncertainties to resolve honestly
 
 - No live provider login/refresh/quota verification without operator-authorized private credential entry. Local app-server fixture is not real provider certification.
