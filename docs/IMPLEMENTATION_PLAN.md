@@ -4,7 +4,7 @@ Written before implementation, 2026-11-08. Execute this plan without another rou
 
 ## Evidence and scope
 
-- ProxyKit `/code/proxykit` is exactly `d0309d10f9474e0b6f9167ee00fa532a72174421`; Codex Broker `/root/code/codex-broker` is exactly `42a931e15daaaa1540958ebdc283c2a48acfcb8b`. No material revision differences. Leave both reference repositories and production data untouched.
+- ProxyKit `/code/proxykit` is exactly `d0309d10f9474e0b6f9167ee00fa532a72174421`; Codex Broker `/root/code/codex-broker` is exactly `42a931e15daaaa1540958ebdc283c2a48acfcb8b`. No material revision differences at initial inspection. Codex Broker and production data remain untouched. Implementation later isolated one necessary ProxyKit correction: read-only native trailer visibility, documented in STATUS.md.
 - Inspected SDK declarations/runtime, Node example, installer/worker/host contracts and source; implementation/status/research documentation and Go example are additional evidence, not APIs to invent. Read-only research covers the full required documentation/reference inventory.
 - No source license grant was found in either reference. Implement behavior independently; use ProxyKit's public SDK declarations for compile-time checking rather than copying its implementation. Preserve the already-authorized reference copy. Do not invent a project license.
 - Small, single-instance application; no second inference proxy, protocol conversion, production deployment, account migration, or npm publication.
@@ -62,6 +62,14 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 3. Both real HTTP listeners, secure boundaries, fixture app-server device flow including denial/expiry/cancel/duplicate/restart and secret absence.
 4. Actual ProxyKit installation/activation system test with local upstream, streaming bytes, cancellation, restart/shutdown, local early responses and managed-call behavior. Production CLI installer uses GitHub only; use production installer fixture and compiled CLI activation locally, then prove public CLI installation from pushed prebuilt repository if network access permits. Do not call a copied installation layout proof of CLI installation.
 5. README, parity/status/provenance, local guided demo script with disposable fixture credentials, exact verification evidence. Small meaningful commits; publish repository commits only, not npm.
+
+## Execution checkpoint
+
+- Milestones 1–3 implemented: compiled extension, durable cycle-disabled policy, provider adapter and two minimal web sites. Provider flow remains fixture-tested, not live-verified.
+- Real GitHub CLI installation and Node-worker system test passed; final revised-package rerun is recorded in STATUS.md. Safe fallback uses supported `child`, not an invalid no-body replacement.
+- Review regression fixes cover quota ordering, process cleanup, refresh admission, queued cancellation, stale label edits, credential generations, bounded session admission and reopenable state-size limits.
+- `finish`/`delivery` counters were not added: only selections and observed original upstream statuses/errors are currently measured. Transport/delivery errors and bytes/token accounting remain unknown.
+- README, fixture demo and private-instance initializer added. Full cycle/relay scheduler, persistent event polling, host trusted-auth admission and live provider certification remain explicit limitations.
 
 ## Uncertainties to resolve honestly
 
