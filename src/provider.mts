@@ -1,18 +1,21 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm, open } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { CodexInstallation } from './codex-install.mjs';
 import { Fault, object, credential, type Credential } from './model.mjs';
+import { pulseTurn, type PulseOutcome } from './pulse.mjs';
 
 // No credential-bearing runtime was created; retrying the original credential is safe.
 export class ProviderAdmissionFault extends Fault {}
 
 export type Device = { loginId: string; url: string; code: string; expiresAt?: number };
-export type ProviderResult = { credential: Credential; identity: string; usage: unknown };
+export type ProviderResult = { credential: Credential; identity: string; usage: unknown; usageStartedAt?: number; observedAt?: number; pulse?: PulseOutcome };
+export type PulseControl = { preflight: (usage: unknown, startedAt: number, observedAt: number) => Promise<boolean>; dispatch: () => Promise<void> };
 export interface Provider {
   prepare?(signal: AbortSignal): Promise<unknown>;
   login(signal: AbortSignal, waiting: (device: Device) => void): Promise<ProviderResult>;
   refresh(saved: Credential, signal: AbortSignal): Promise<ProviderResult>;
+  pulse?(saved: Credential, signal: AbortSignal, control: PulseControl): Promise<ProviderResult>;
   close(): Promise<void>;
 }
 class Runtime {
@@ -21,22 +24,23 @@ class Runtime {
   private notify: ((method: string, params: unknown) => void) | undefined;
   private failed: Error | undefined;
   private closed: Promise<void>;
+  private stopping: Promise<void> | undefined;
   readonly child: ChildProcessWithoutNullStreams;
   loginId: string | undefined;
   constructor(command: string, readonly home: string, signal: AbortSignal) {
     this.child = spawn(command, ['app-server'], { cwd: home, env: {
       PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, CODEX_HOME: home,
       TMPDIR: join(home, 'tmp'), LANG: 'C.UTF-8',
-    }, stdio: 'pipe' });
+    }, stdio: 'pipe', detached: true });
     this.closed = new Promise(resolve => this.child.once('close', () => { this.fail(new Fault('PROVIDER_EXITED')); resolve(); }));
     this.child.once('error', () => this.fail(new Fault('PROVIDER_UNAVAILABLE')));
     this.child.stdin.on('error', () => this.fail(new Fault('PROVIDER_EXITED')));
     this.child.stderr.resume(); // Never forward provider diagnostics: they may include credentials.
-    let buffer = '';
+    let buffer = '', total = 0;
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk: string) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > 1024 * 1024) { this.fail(new Fault('PROVIDER_FRAME_LIMIT')); this.child.kill('SIGKILL'); return; }
+      buffer += chunk; total += Buffer.byteLength(chunk);
+      if (Buffer.byteLength(buffer) > 1024 * 1024 || total > 8 * 1024 * 1024) { this.fail(new Fault('PROVIDER_FRAME_LIMIT')); this.kill('SIGKILL'); return; }
       let end: number;
       while ((end = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
@@ -46,12 +50,12 @@ class Runtime {
             const p = this.pending.get(msg.id);
             if (p) { clearTimeout(p.timer); this.pending.delete(msg.id); msg.error ? p.reject(new Fault('PROVIDER_RPC_FAILED')) : p.resolve(msg.result); }
           } else if (typeof msg.method === 'string') this.notify?.(msg.method, msg.params);
-        } catch { this.fail(new Fault('PROVIDER_PROTOCOL_ERROR')); this.child.kill('SIGKILL'); }
+        } catch { this.fail(new Fault('PROVIDER_PROTOCOL_ERROR')); this.kill('SIGKILL'); }
       }
     });
     const abort = () => {
       if (this.loginId && !this.child.stdin.destroyed) this.child.stdin.write(JSON.stringify({ id: ++this.next, method: 'account/login/cancel', params: { loginId: this.loginId } }) + '\n');
-      this.fail(new Fault('CANCELLED', 499)); this.child.kill('SIGTERM');
+      this.fail(new Fault('CANCELLED', 499)); this.kill('SIGTERM');
     };
     signal.addEventListener('abort', abort, { once: true });
     this.closed.then(() => signal.removeEventListener('abort', abort));
@@ -91,11 +95,31 @@ class Runtime {
       if (signal.aborted) abort();
     });
   }
-  async stop() {
-    this.child.kill('SIGTERM');
-    const timer = setTimeout(() => this.child.kill('SIGKILL'), 500);
-    try { await this.closed; } finally { clearTimeout(timer); }
+  listen(callback: (method: string, params: unknown) => void) {
+    this.notify = callback;
+    if (this.failed) callback('broker/error', null);
+    return () => { if (this.notify === callback) this.notify = undefined; };
   }
+  private kill(signal: NodeJS.Signals) {
+    if (this.child.pid) { try { process.kill(-this.child.pid, signal); } catch { /* Already reaped. */ } }
+  }
+  stop(): Promise<void> {
+    return this.stopping ??= (async () => {
+      this.kill('SIGTERM');
+      const timer = setTimeout(() => this.kill('SIGKILL'), 500);
+      try { await this.closed; } finally { clearTimeout(timer); this.kill('SIGKILL'); }
+    })();
+  }
+}
+
+async function readCredential(home: string): Promise<Credential> {
+  const file = await open(join(home, 'auth.json'), 'r');
+  try {
+    const buffer = Buffer.alloc(256 * 1024 + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead === buffer.length) throw new Fault('INVALID_CREDENTIAL');
+    return credential(JSON.parse(buffer.subarray(0, bytesRead).toString()));
+  } finally { await file.close(); }
 }
 
 export class CodexProvider implements Provider {
@@ -111,7 +135,7 @@ export class CodexProvider implements Provider {
     if (this.stopped || signal.aborted) return Promise.reject(new ProviderAdmissionFault('CANCELLED', 499));
     return this.command !== undefined ? Promise.resolve(this.command) : this.installation!.prepare(AbortSignal.any([signal, this.shutdown.signal]));
   }
-  private async run(signal: AbortSignal, saved: Credential | null, waiting?: (device: Device) => void): Promise<ProviderResult> {
+  private async run(signal: AbortSignal, saved: Credential | null, waiting?: (device: Device) => void, control?: PulseControl): Promise<ProviderResult> {
     if (this.stopped || signal.aborted) throw new ProviderAdmissionFault('CANCELLED', 499);
     // Reserve before the first await to bound concurrent creation too.
     // Public device logins leave one slot for credential refresh (when capacity permits).
@@ -147,13 +171,27 @@ export class CodexProvider implements Provider {
       }
       const account = object(object(await runtime.request('account/read', { refreshToken: !!saved })).account);
       if (account.type !== 'chatgpt' || typeof account.email !== 'string' || !account.email.trim()) throw new Fault('UNSUPPORTED_ACCOUNT');
-      let usage: unknown = null;
-      try { usage = await runtime.request('account/rateLimits/read', {}); } catch { /* Credential success does not imply quota is known. */ }
+      let usage: unknown = null, usageStartedAt = Date.now(), observedAt = usageStartedAt, pulse: PulseOutcome | undefined;
+      try { usage = await runtime.request('account/rateLimits/read', {}); observedAt = Date.now(); } catch { /* Credential success does not imply quota is known. */ }
+      if (control) {
+        let dispatched = false;
+        try {
+          const current = await readCredential(home);
+          if (current.accountId !== saved?.accountId) throw new Fault('IDENTITY_CHANGED');
+          if (!await control.preflight(usage, usageStartedAt, observedAt)) pulse = { status: 'skipped', code: 'PULSE_USAGE_UNCONFIRMED' };
+          else pulse = await pulseTurn(runtime, signal, async () => { await control.dispatch(); dispatched = true; });
+        } catch (e) {
+          pulse = { status: dispatched ? 'uncertain' : 'failed', code: e instanceof Fault ? e.code : 'PULSE_FAILED' };
+        }
+        if (!signal.aborted) {
+          usageStartedAt = Date.now(); usage = null;
+          try { usage = await runtime.request('account/rateLimits/read', {}); observedAt = Date.now(); } catch { /* Keep uncertainty visible. */ }
+        } else usage = null;
+      }
       await runtime.stop();
-      if (this.stopped || signal.aborted) throw new Fault('CANCELLED', 499);
-      const raw = await readFile(join(home, 'auth.json'));
-      if (raw.length > 256 * 1024) throw new Fault('INVALID_CREDENTIAL');
-      return { credential: credential(JSON.parse(raw.toString())), identity: account.email.trim().toLowerCase(), usage };
+      // Even cancelled/failed inference can rotate credentials. Checkpoint after reaping, before routing.
+      if (!control && (this.stopped || signal.aborted)) throw new Fault('CANCELLED', 499);
+      return { credential: await readCredential(home), identity: account.email.trim().toLowerCase(), usage, usageStartedAt, observedAt, ...(pulse ? { pulse } : {}) };
     } catch (e) {
       const error = expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED');
       throw runtime?.child.pid ? error : new ProviderAdmissionFault(error.code, error.status);
@@ -166,14 +204,15 @@ export class CodexProvider implements Provider {
     }
   }
   private reserved = 0;
-  private operation(signal: AbortSignal, saved: Credential | null, waiting?: (device: Device) => void) {
-    const work = this.run(AbortSignal.any([signal, this.shutdown.signal]), saved, waiting);
+  private operation(signal: AbortSignal, saved: Credential | null, waiting?: (device: Device) => void, control?: PulseControl) {
+    const work = this.run(AbortSignal.any([signal, this.shutdown.signal]), saved, waiting, control);
     this.operations.add(work);
     work.then(() => this.operations.delete(work), () => this.operations.delete(work));
     return work;
   }
   login(signal: AbortSignal, waiting: (device: Device) => void) { return this.operation(signal, null, waiting); }
   refresh(saved: Credential, signal: AbortSignal) { return this.operation(signal, saved); }
+  pulse(saved: Credential, signal: AbortSignal, control: PulseControl) { return this.operation(signal, saved, undefined, control); }
   async close() {
     this.stopped = true; this.shutdown.abort();
     await Promise.all([this.installation?.close(), ...[...this.active].map(r => r.stop())]);

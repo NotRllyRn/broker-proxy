@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm, open } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { CodexInstallation } from './codex-install.mjs';
 import { Fault, object, credential } from './model.mjs';
+import { pulseTurn } from './pulse.mjs';
 // No credential-bearing runtime was created; retrying the original credential is safe.
 export class ProviderAdmissionFault extends Fault {
 }
@@ -13,6 +14,7 @@ class Runtime {
     notify;
     failed;
     closed;
+    stopping;
     child;
     loginId;
     constructor(command, home, signal) {
@@ -20,18 +22,19 @@ class Runtime {
         this.child = spawn(command, ['app-server'], { cwd: home, env: {
                 PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, CODEX_HOME: home,
                 TMPDIR: join(home, 'tmp'), LANG: 'C.UTF-8',
-            }, stdio: 'pipe' });
+            }, stdio: 'pipe', detached: true });
         this.closed = new Promise(resolve => this.child.once('close', () => { this.fail(new Fault('PROVIDER_EXITED')); resolve(); }));
         this.child.once('error', () => this.fail(new Fault('PROVIDER_UNAVAILABLE')));
         this.child.stdin.on('error', () => this.fail(new Fault('PROVIDER_EXITED')));
         this.child.stderr.resume(); // Never forward provider diagnostics: they may include credentials.
-        let buffer = '';
+        let buffer = '', total = 0;
         this.child.stdout.setEncoding('utf8');
         this.child.stdout.on('data', (chunk) => {
             buffer += chunk;
-            if (Buffer.byteLength(buffer) > 1024 * 1024) {
+            total += Buffer.byteLength(chunk);
+            if (Buffer.byteLength(buffer) > 1024 * 1024 || total > 8 * 1024 * 1024) {
                 this.fail(new Fault('PROVIDER_FRAME_LIMIT'));
-                this.child.kill('SIGKILL');
+                this.kill('SIGKILL');
                 return;
             }
             let end;
@@ -53,7 +56,7 @@ class Runtime {
                 }
                 catch {
                     this.fail(new Fault('PROVIDER_PROTOCOL_ERROR'));
-                    this.child.kill('SIGKILL');
+                    this.kill('SIGKILL');
                 }
             }
         });
@@ -61,7 +64,7 @@ class Runtime {
             if (this.loginId && !this.child.stdin.destroyed)
                 this.child.stdin.write(JSON.stringify({ id: ++this.next, method: 'account/login/cancel', params: { loginId: this.loginId } }) + '\n');
             this.fail(new Fault('CANCELLED', 499));
-            this.child.kill('SIGTERM');
+            this.kill('SIGTERM');
         };
         signal.addEventListener('abort', abort, { once: true });
         this.closed.then(() => signal.removeEventListener('abort', abort));
@@ -115,15 +118,46 @@ class Runtime {
                 abort();
         });
     }
-    async stop() {
-        this.child.kill('SIGTERM');
-        const timer = setTimeout(() => this.child.kill('SIGKILL'), 500);
-        try {
-            await this.closed;
+    listen(callback) {
+        this.notify = callback;
+        if (this.failed)
+            callback('broker/error', null);
+        return () => { if (this.notify === callback)
+            this.notify = undefined; };
+    }
+    kill(signal) {
+        if (this.child.pid) {
+            try {
+                process.kill(-this.child.pid, signal);
+            }
+            catch { /* Already reaped. */ }
         }
-        finally {
-            clearTimeout(timer);
-        }
+    }
+    stop() {
+        return this.stopping ??= (async () => {
+            this.kill('SIGTERM');
+            const timer = setTimeout(() => this.kill('SIGKILL'), 500);
+            try {
+                await this.closed;
+            }
+            finally {
+                clearTimeout(timer);
+                this.kill('SIGKILL');
+            }
+        })();
+    }
+}
+async function readCredential(home) {
+    const file = await open(join(home, 'auth.json'), 'r');
+    try {
+        const buffer = Buffer.alloc(256 * 1024 + 1);
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        if (bytesRead === buffer.length)
+            throw new Fault('INVALID_CREDENTIAL');
+        return credential(JSON.parse(buffer.subarray(0, bytesRead).toString()));
+    }
+    finally {
+        await file.close();
     }
 }
 export class CodexProvider {
@@ -147,7 +181,7 @@ export class CodexProvider {
             return Promise.reject(new ProviderAdmissionFault('CANCELLED', 499));
         return this.command !== undefined ? Promise.resolve(this.command) : this.installation.prepare(AbortSignal.any([signal, this.shutdown.signal]));
     }
-    async run(signal, saved, waiting) {
+    async run(signal, saved, waiting, control) {
         if (this.stopped || signal.aborted)
             throw new ProviderAdmissionFault('CANCELLED', 499);
         // Reserve before the first await to bound concurrent creation too.
@@ -193,18 +227,43 @@ export class CodexProvider {
             const account = object(object(await runtime.request('account/read', { refreshToken: !!saved })).account);
             if (account.type !== 'chatgpt' || typeof account.email !== 'string' || !account.email.trim())
                 throw new Fault('UNSUPPORTED_ACCOUNT');
-            let usage = null;
+            let usage = null, usageStartedAt = Date.now(), observedAt = usageStartedAt, pulse;
             try {
                 usage = await runtime.request('account/rateLimits/read', {});
+                observedAt = Date.now();
             }
             catch { /* Credential success does not imply quota is known. */ }
+            if (control) {
+                let dispatched = false;
+                try {
+                    const current = await readCredential(home);
+                    if (current.accountId !== saved?.accountId)
+                        throw new Fault('IDENTITY_CHANGED');
+                    if (!await control.preflight(usage, usageStartedAt, observedAt))
+                        pulse = { status: 'skipped', code: 'PULSE_USAGE_UNCONFIRMED' };
+                    else
+                        pulse = await pulseTurn(runtime, signal, async () => { await control.dispatch(); dispatched = true; });
+                }
+                catch (e) {
+                    pulse = { status: dispatched ? 'uncertain' : 'failed', code: e instanceof Fault ? e.code : 'PULSE_FAILED' };
+                }
+                if (!signal.aborted) {
+                    usageStartedAt = Date.now();
+                    usage = null;
+                    try {
+                        usage = await runtime.request('account/rateLimits/read', {});
+                        observedAt = Date.now();
+                    }
+                    catch { /* Keep uncertainty visible. */ }
+                }
+                else
+                    usage = null;
+            }
             await runtime.stop();
-            if (this.stopped || signal.aborted)
+            // Even cancelled/failed inference can rotate credentials. Checkpoint after reaping, before routing.
+            if (!control && (this.stopped || signal.aborted))
                 throw new Fault('CANCELLED', 499);
-            const raw = await readFile(join(home, 'auth.json'));
-            if (raw.length > 256 * 1024)
-                throw new Fault('INVALID_CREDENTIAL');
-            return { credential: credential(JSON.parse(raw.toString())), identity: account.email.trim().toLowerCase(), usage };
+            return { credential: await readCredential(home), identity: account.email.trim().toLowerCase(), usage, usageStartedAt, observedAt, ...(pulse ? { pulse } : {}) };
         }
         catch (e) {
             const error = expiry.signal.aborted ? new Fault('LOGIN_EXPIRED', 400) : e instanceof Fault ? e : new Fault('PROVIDER_FAILED');
@@ -222,14 +281,15 @@ export class CodexProvider {
         }
     }
     reserved = 0;
-    operation(signal, saved, waiting) {
-        const work = this.run(AbortSignal.any([signal, this.shutdown.signal]), saved, waiting);
+    operation(signal, saved, waiting, control) {
+        const work = this.run(AbortSignal.any([signal, this.shutdown.signal]), saved, waiting, control);
         this.operations.add(work);
         work.then(() => this.operations.delete(work), () => this.operations.delete(work));
         return work;
     }
     login(signal, waiting) { return this.operation(signal, null, waiting); }
     refresh(saved, signal) { return this.operation(signal, saved); }
+    pulse(saved, signal, control) { return this.operation(signal, saved, undefined, control); }
     async close() {
         this.stopped = true;
         this.shutdown.abort();
