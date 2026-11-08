@@ -59,17 +59,16 @@ const setup: HTTPSetup = async api => {
     const safe = (method: string) => ['GET', 'HEAD', 'OPTIONS'].includes(method);
     if (!config.safeFallback || input.identity.depth !== 0 || !input.metadata.account || input.response.status < 500
       || !safe(input.requested.method) || !safe(input.request.method)
-      || header(input.requested.header, 'content-length').some(v => v !== '0')
+      || header(input.requested.header, 'content-length').length !== 1 || header(input.requested.header, 'content-length')[0] !== '0'
       || header(input.requested.header, 'transfer-encoding').length
       || header(input.requested.header, 'accept').some(v => v.includes('text/event-stream'))) return { action: 'pass' };
     const gateway = typeof api.config === 'object' && api.config && !Array.isArray(api.config) ? api.config.gatewayOrigin : null;
     if (typeof gateway !== 'string') return { action: 'pass' };
-    const url = new URL(input.requested.url), origin = new URL(gateway);
+    const url = new URL(input.requested.url, gateway), origin = new URL(gateway);
     const authorization = header(input.requested.header, 'authorization');
     if (authorization.length !== 1) return { action: 'pass' };
-    const result = await context.http({ method: input.requested.method, url: origin.origin + url.pathname + url.search,
-      header: { ...safeHeaders(input.requested.header), Authorization: authorization }, status: 0, body: '' });
-    return { action: 'replace', message: result };
+    return { action: 'child', request: { method: input.requested.method, url: origin.origin + url.pathname + url.search,
+      header: { ...safeHeaders(input.requested.header), Authorization: authorization }, status: 0, body: '' } };
   });
   api.log('Broker Proxy ready; application-owned authentication; quota snapshots are not token usage');
 };

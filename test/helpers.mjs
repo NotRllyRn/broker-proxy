@@ -16,6 +16,17 @@ export async function fixtureCommand(dir, mode = 'success') {
   await writeFile(path, `#!${process.execPath}\nimport { run } from ${JSON.stringify(resolve('test/provider-fixture.mjs'))};\nrun(${JSON.stringify(mode)});\n`);
   await chmod(path, 0o700); return path;
 }
+export function browser(origin) {
+  let cookie = '', csrf = '';
+  return { async request(path = '/', data, extra = {}) {
+    const res = await fetch(origin + path, { method: data ? 'POST' : 'GET', redirect: 'manual', headers: {
+      Cookie: cookie, ...(data ? { Origin: origin, 'Content-Type': 'application/x-www-form-urlencoded' } : {}), ...extra,
+    }, body: data ? new URLSearchParams({ csrf, ...data }) : undefined });
+    if (res.headers.get('set-cookie')) cookie = res.headers.get('set-cookie').split(';')[0];
+    const text = await res.text(); csrf = text.match(/name="csrf" value="([^"]+)"/)?.[1] ?? csrf;
+    return { status: res.status, text, headers: res.headers };
+  } };
+}
 export const delay = ms => new Promise(r => setTimeout(r, ms));
 export async function until(fn, timeout = 5000) {
   const end = Date.now() + timeout;
