@@ -3,8 +3,9 @@
 package main
 
 import (
-	"archive/zip"
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -18,20 +19,23 @@ import (
 func main() {
 	const revision = "2222222222222222222222222222222222222222" // Synthetic fixture identity, not a GitHub commit.
 	var archive bytes.Buffer
-	z := zip.NewWriter(&archive)
+	gz := gzip.NewWriter(&archive)
+	z := tar.NewWriter(gz)
 	for name, content := range map[string]string{
 		"proxykit-extension.json": `{"manifestVersion":1,"apiVersion":1,"id":"activation-fixture","version":"1.0.0","entry":"extension.mjs"}`,
 		"extension.mjs":           `export default api => api.on({id:'header',stage:'responseStart',bodyMode:'none'}, input => ({action:'replace',message:{...input.response,header:{...input.response.header,'X-Activation-Fixture':['enabled']}}}));`,
 	} {
-		w, err := z.Create("fixture/" + name)
-		if err != nil {
+		if err := z.WriteHeader(&tar.Header{Name: "fixture/" + name, Mode: 0600, Size: int64(len(content))}); err != nil {
 			panic(err)
 		}
-		if _, err = w.Write([]byte(content)); err != nil {
+		if _, err := z.Write([]byte(content)); err != nil {
 			panic(err)
 		}
 	}
 	if err := z.Close(); err != nil {
+		panic(err)
+	}
+	if err := gz.Close(); err != nil {
 		panic(err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

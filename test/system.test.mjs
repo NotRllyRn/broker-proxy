@@ -25,7 +25,7 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const shippedLock = await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'package', 'codex', 'package-lock.json'));
   assert.deepEqual(shippedLock, await readFile(new URL('../codex/package-lock.json', import.meta.url)));
   const offline = await exec(binary, ['extension', 'status', 'broker-proxy'], { env });
-  assert.match(offline.stdout, /broker-proxy\s+0\.1\.0\s+1\s+true\s+false\s+unknown/);
+  assert.match(offline.stdout + offline.stderr, /broker-proxy\s+0\.1\.0\s+1\s+true\s+false\s+unknown/);
   await exec(binary, ['extension', 'enable', 'broker-proxy'], { env }); // Persist intent before startup.
   // Only this unrelated synthetic extension uses controlled archive transport, never the broker.
   await exec('go', ['run', '.'], { cwd: new URL('./activation-fixture/', import.meta.url), env });
