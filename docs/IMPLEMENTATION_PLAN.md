@@ -110,6 +110,12 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 - Assert live unrelated enable/disable toggles headers without changing broker PID, either listener socket, lock, authenticated admin session or account/pulse state. Check shutdown listener/process cleanup and both broker lock removal and host OS lock release. Retain trailer rejection and existing pulse/restart coverage.
 - Preserve the pending pulse evidence after checking `/tmp/broker-pulse-system.log`. Run build/unit tests, the real pinned Codex schema/initialize probe (no account), repeated actual installed-system tests and demo smoke at the published candidate. Commit/push the minimal migration, then record exact evidence in a documentation commit; distinguish controlled fixtures from real GitHub downloads and live-provider verification.
 
+### Companion migration execution checkpoint
+
+- Published migration `407da0a` and test-harness correction `2173cf2`; application/build/Codex pulse files remain identical to `51a6c45`. Preserved preceding pulse verification after checking its system log. No delegates or shared-host checkout edits.
+- Against published ProxyKit `07a8cd010fc171a0d1cb9c5254ccbfee5714e536`: 75 unit/HTTP tests, one real account-free Codex install/schema/initialize probe, three consecutive real GitHub-installed system runs at full candidate `2173cf250e57a8b980c4dcdab545008adaeb4f29`, and demo install/enable/pulse/enrollment/forwarding/restart smoke passed. Exact binary provenance and boundaries are in STATUS.md.
+- Reusable Linux resource/session/state assertions and shutdown OS-lock acquisition now cover unrelated live enable/disable. Only the second extension is a controlled-archive fixture; the broker uses the actual GitHub CLI install. Provider account behavior remains synthetic, not certified live.
+
 ## Uncertainties to resolve honestly
 
 - No live provider login/refresh/quota verification without operator-authorized private credential entry. Local app-server fixture is not real provider certification.
