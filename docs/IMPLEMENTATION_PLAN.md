@@ -134,6 +134,11 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 - Normal README flow: install --trust → enable → start; online --activate is supported. Explain secret retrieval from the known store's `.data/broker-proxy/secrets.json` on a private terminal, not via logs/HTTP. No manual directory creation/discovery/init step. Ports remain configurable with no automatic allocation.
 - Verify actual installed automatic initialization on an empty install-created directory without env/manual preparation, private/stable secrets, restart/removal/reinstall/pulse persistence, unsafe/partial/no-clobber behavior, concurrent init exclusion, explicit legacy override, unchanged unrelated activation resources/session and final cleanup. Fixture-heavy system/demo runs may edit an already initialized disposable config to select synthetic providers/ports; label this separately from the actual default bootstrap test. Publish candidate before real GitHub tests; record exact evidence afterward.
 
+### Storage migration outcome
+
+- Published runtime candidate `e82d5b36ff6432c81e33f71ab6e198d2014491d8` implements the amended automatic setup UX, not the cancelled manual workflow. Against ProxyKit `0559b73e2bb35961fc33577d72c39cd4ac7933ca`: **85 unit/HTTP tests**, **one real account-free Codex install/schema/initialize probe**, **three consecutive actual GitHub-installed system runs** and **demo smoke with durable restart** passed. System tests distinguish two actual-default boots from subsequent explicit synthetic-provider edits, cover six boots plus unsafe/partial refusal and preserve unrelated hot-activation resources. Details and source evidence are in STATUS.md.
+- No delegates, real accounts, production deployment, shared-host edits or new upstream reportback. Evidence-only follow-up does not alter the tested runtime. Keep conservative operator recovery for interrupted initialization, trusted filesystem ancestors and configurable fixed ports; no migration/onboarding framework added.
+
 ## Uncertainties to resolve honestly
 
 - No live provider login/refresh/quota verification without operator-authorized private credential entry. Local app-server fixture is not real provider certification.
