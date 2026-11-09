@@ -1,5 +1,5 @@
-import { readFile, stat } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { readFile, lstat } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { Fault, object, text, labels } from './model.mjs';
 function listener(value, port) {
     const v = value ? object(value) : {};
@@ -14,13 +14,29 @@ function listener(value, port) {
         throw new Fault('INVALID_ORIGIN');
     return { host, port: Number(p), origin: origin.origin };
 }
-export async function loadConfig(path = process.env.BROKER_CONFIG) {
+export async function loadConfig(path = process.env.BROKER_CONFIG, hostDataDir) {
+    if (path === undefined) {
+        if (!hostDataDir || !isAbsolute(hostDataDir))
+            throw new Fault('HOST_DATA_DIR_REQUIRED');
+        path = join(hostDataDir, 'config.json');
+    }
     if (!path || !isAbsolute(path))
         throw new Fault('BROKER_CONFIG_REQUIRED');
-    const info = await stat(path);
-    if (!info.isFile() || info.size > 65536 || (info.mode & 0o077))
+    const info = await lstat(path).catch(e => {
+        if (e.code === 'ENOENT')
+            throw new Fault('BROKER_CONFIG_NOT_INITIALIZED');
+        throw e;
+    });
+    if (!info.isFile() || info.size > 65536 || (info.mode & 0o077) || info.uid !== process.getuid?.())
         throw new Fault('CONFIG_MUST_BE_PRIVATE');
-    const v = object(JSON.parse(await readFile(path, 'utf8')));
+    let value;
+    try {
+        value = JSON.parse(await readFile(path, 'utf8'));
+    }
+    catch {
+        throw new Fault('INVALID_CONFIG');
+    }
+    const v = object(value);
     const dataDir = text(v.dataDir, 4096);
     if (!isAbsolute(dataDir))
         throw new Fault('ABSOLUTE_DATA_DIR_REQUIRED');

@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { loadConfig } from './config.mjs';
+import { initialize } from './initialize.mjs';
 import { Store } from './store.mjs';
 import { Broker } from './broker.mjs';
 import { CodexProvider } from './provider.mjs';
@@ -19,7 +20,7 @@ const bearer = (input) => {
     return values[0].slice(7);
 };
 const setup = async (api) => {
-    const config = await loadConfig();
+    const config = process.env.BROKER_CONFIG === undefined ? await initialize(api.dataDir, true) : await loadConfig(process.env.BROKER_CONFIG);
     const store = await Store.open(config.dataDir);
     const provider = new CodexProvider(join(config.dataDir, 'runtimes'), config.codexCommand);
     const broker = new Broker(store, provider, config.enrollmentLabels);

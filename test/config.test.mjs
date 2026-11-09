@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, chmod, rm } from 'node:fs/promises';
+import { writeFile, chmod, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../build/config.mjs';
 import { digest } from '../build/model.mjs';
@@ -27,4 +27,31 @@ test('configuration validates private files, distinct ports, origins, limits and
   ]) { await save(value); await assert.rejects(loadConfig(path), error); }
   await save({ enrollment: { host: '0.0.0.0', origin: 'https://enroll.example.invalid' }, pollMs: 0 });
   assert.equal((await loadConfig(path)).enrollment.origin, 'https://enroll.example.invalid');
+});
+
+test('host config default, explicit legacy precedence and no CWD or invalid-override fallback', async t => {
+  const dir = await temp(), path = join(dir, 'config.json'), legacy = join(dir, 'legacy.json');
+  const previous = process.env.BROKER_CONFIG; delete process.env.BROKER_CONFIG;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.BROKER_CONFIG; else process.env.BROKER_CONFIG = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await assert.rejects(loadConfig(), /HOST_DATA_DIR_REQUIRED/);
+  await assert.rejects(loadConfig(undefined, 'relative'), /HOST_DATA_DIR_REQUIRED/);
+  await assert.rejects(loadConfig(undefined, dir), /BROKER_CONFIG_NOT_INITIALIZED/);
+  const base = { adminHash: digest('fixture-admin'), dataDir: join(dir, 'data') };
+  await writeFile(path, JSON.stringify(base), { mode: 0o600 });
+  assert.equal((await loadConfig(undefined, dir)).dataDir, base.dataDir);
+  const external = join(dir, 'external-state');
+  await writeFile(legacy, JSON.stringify({ ...base, dataDir: external }), { mode: 0o600 });
+  process.env.BROKER_CONFIG = legacy;
+  assert.equal((await loadConfig(undefined, dir)).dataDir, external);
+  assert.equal((await loadConfig()).dataDir, external); // Older hosts still work with explicit config.
+  assert.equal((await loadConfig(path, dir)).dataDir, base.dataDir);
+  for (const invalid of ['', 'relative']) await assert.rejects(loadConfig(invalid, dir), /BROKER_CONFIG_REQUIRED/);
+  await assert.rejects(loadConfig(join(dir, 'missing'), dir), /BROKER_CONFIG_NOT_INITIALIZED/);
+  const link = join(dir, 'linked.json'); await symlink(path, link);
+  await assert.rejects(loadConfig(link, dir), /CONFIG_MUST_BE_PRIVATE/);
+  await writeFile(legacy, '{', { mode: 0o600 });
+  await assert.rejects(loadConfig(undefined, dir), /INVALID_CONFIG/);
 });

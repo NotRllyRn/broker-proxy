@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createServer, request as httpRequest } from 'node:http';
 import { join } from 'node:path';
-import { readFile, writeFile, rm, access, readdir, readlink, stat } from 'node:fs/promises';
+import { readFile, writeFile, rm, access, readdir, readlink, stat, cp, chmod } from 'node:fs/promises';
 import { Store } from '../build/store.mjs';
 import { Broker } from '../build/broker.mjs';
 import { digest } from '../build/model.mjs';
@@ -13,10 +13,14 @@ import { temp, port, auth, browser, until, fixtureCommand, delay } from './helpe
 const exec = promisify(execFile);
 
 test('real GitHub CLI installation → compiled ProxyKit → installed Node worker → upstream; hot activation and lifecycle', { timeout: 180000, skip: process.platform !== 'linux' && 'Linux /proc and flock assertions' }, async t => {
-  const dir = await temp(), dataDir = join(dir, 'data');
+  const dir = await temp();
   const binary = process.env.PROXYKIT_BINARY || '/tmp/broker-proxy-proxykit';
   const ref = process.env.BROKER_TEST_REF || (await exec('git', ['rev-parse', 'HEAD'])).stdout.trim();
-  const env = { ...process.env, PROXYKIT_EXTENSIONS_DIR: join(dir, 'extensions'), BROKER_CONFIG: join(dir, 'config.json') };
+  const env = { ...process.env, PROXYKIT_EXTENSIONS_DIR: join(dir, 'extensions') };
+  delete env.BROKER_CONFIG;
+  const hostDir = join(env.PROXYKIT_EXTENSIONS_DIR, '.data', 'broker-proxy');
+  const configPath = join(hostDir, 'config.json');
+  let dataDir = join(hostDir, 'data');
   const installed = await exec(binary, ['extension', 'install', `https://github.com/NotRllyRn/broker-proxy/tree/${ref}`, '--trust'], { env });
   assert.match(installed.stdout + installed.stderr, /Installed broker-proxy/);
   const installation = JSON.parse(await readFile(join(env.PROXYKIT_EXTENSIONS_DIR, 'broker-proxy', 'installation.json')));
@@ -26,7 +30,50 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   assert.deepEqual(shippedLock, await readFile(new URL('../codex/package-lock.json', import.meta.url)));
   const offline = await exec(binary, ['extension', 'status', 'broker-proxy'], { env });
   assert.match(offline.stdout + offline.stderr, /broker-proxy\s+0\.1\.0\s+1\s+true\s+false\s+unknown/);
-  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env }); // Persist intent before startup.
+  assert.equal((await stat(hostDir)).mode & 0o7777, 0o700);
+  assert.deepEqual(await readdir(hostDir), [], 'install creates only the private directory, without executing package code');
+  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env });
+  // Actual default setup: no manual initialization, fixture adapter or environment config.
+  const bootstrapPort = await port();
+  let defaultLogs = '', secrets, secretBytes;
+  for (let boot = 0; boot < 2; boot++) {
+    const child = spawn(binary, ['-listen', `127.0.0.1:${bootstrapPort}`, '-upstream', 'http://127.0.0.1:1'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', b => defaultLogs += b); child.stderr.on('data', b => defaultLogs += b);
+    let pid;
+    try {
+      await until(async () => {
+        if (child.exitCode !== null) throw Error('Default bootstrap exited: ' + defaultLogs);
+        try { return (await fetch('http://127.0.0.1:8788')).status === 200; } catch { return false; }
+      }, 15000);
+      pid = Number(await readFile(join(dataDir, 'lock'), 'utf8'));
+      const bytes = await readFile(join(hostDir, 'secrets.json'));
+      if (boot) assert.deepEqual(bytes, secretBytes); else secretBytes = bytes;
+      secrets = JSON.parse(bytes);
+      const admin = browser('http://127.0.0.1:8788'); await admin.request();
+      await admin.request('/login', { secret: secrets.admin }); await admin.request();
+      const status = JSON.parse((await admin.request('/api/status')).text);
+      assert.equal(status.accounts.length, 0); assert.equal(status.pulseSettings.enabled, false);
+      assert.equal((await fetch(`http://127.0.0.1:${bootstrapPort}/v1/models`, { headers: { Authorization: `Bearer ${secrets.caller}` } })).status, 503);
+      for (const path of [configPath, join(hostDir, 'secrets.json'), join(dataDir, 'state.json')]) {
+        const info = await stat(path); assert.equal(info.mode & 0o7777, 0o600); assert.equal(info.uid, process.getuid());
+      }
+      assert.equal(JSON.parse(await readFile(configPath)).dataDir, dataDir);
+      assert.equal((await stat(dataDir)).mode & 0o7777, 0o700);
+    } finally {
+      if (child.exitCode === null) {
+        const exited = once(child, 'exit'); child.kill('SIGTERM');
+        const kill = setTimeout(() => child.kill('SIGKILL'), 7000);
+        const [code, signal] = await exited; clearTimeout(kill); assert.equal(signal, null, defaultLogs); assert.equal(code, 0, defaultLogs);
+      }
+    }
+    await assert.rejects(access(join(dataDir, 'lock')));
+    if (pid) await assert.rejects(access(`/proc/${pid}`));
+    for (const port of [8788, 8789, bootstrapPort]) await assert.rejects(fetch(`http://127.0.0.1:${port}`));
+    await exec('flock', ['-n', join(env.PROXYKIT_EXTENSIONS_DIR, '.owner-lock'), 'true']);
+  }
+  for (const secret of Object.values(secrets)) assert.ok(!defaultLogs.includes(secret));
+  await exec(binary, ['extension', 'disable', 'broker-proxy'], { env });
+  t.diagnostic('Default install-created empty directory auto-initialized privately on first setup, no BROKER_CONFIG/manual prep; two account-free boots preserve generated credentials, with no inference. Managed Codex preparation may run; fixture phase below explicitly overrides it.');
   // Only this unrelated synthetic extension uses controlled archive transport, never the broker.
   await exec('go', ['run', '.'], { cwd: new URL('./activation-fixture/', import.meta.url), env });
   const ownerLock = join(env.PROXYKIT_EXTENSIONS_DIR, '.owner-lock');
@@ -60,8 +107,9 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const a = await seed.importAccount('Example user', ['private'], alpha);
   await seed.importAccount('Personal usage', ['shared'], auth('b'));
   await seed.close();
-  await writeFile(env.BROKER_CONFIG, JSON.stringify({ dataDir, adminHash: digest('fixture-admin-secret'), upstream: `http://127.0.0.1:${upstreamPort}/backend`,
+  await writeFile(configPath, JSON.stringify({ dataDir, adminHash: digest('fixture-admin-secret'), upstream: `http://127.0.0.1:${upstreamPort}/backend`,
     dashboard: { port: adminPort }, enrollment: { port: publicPort }, codexCommand: await fixtureCommand(dir), pollMs: 0, safeFallback: true }), { mode: 0o600 });
+  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env }); // Fixture-only config edits above, while stopped.
   let child, workerPid, logs = '';
   const start = async () => {
     child = spawn(binary, ['-listen', `127.0.0.1:${dataPort}`, '-upstream', `http://127.0.0.1:${upstreamPort}`, '-node', process.execPath], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -192,6 +240,52 @@ test('real GitHub CLI installation → compiled ProxyKit → installed Node work
   const freshPublic = browser(publicOrigin); assert.deepEqual(JSON.parse((await freshPublic.request('/status')).text), { state: 'idle' });
   assert.doesNotMatch(logs, /fixture-system-caller|fixture-scoped-caller|fixture-refresh|not-a-real-signature|private-cookie|private-key|private-trailer/);
   await stop();
-  await assert.rejects(access(join(dataDir, 'codex'))); // Explicit fixture override must never install the real CLI.
-  t.diagnostic(`Verified actual GitHub CLI install at ${ref}; two boots, declared trailers rejected, opaque SSE, cancellation, scoped credentials, managed safe-method fallback; manual/background pulses/settings/stats, restart and final process/listener/lock cleanup. Only unrelated header installation uses controlled archive transport; upstream/app-server are synthetic, not live-provider verification.`);
+  const durable = await readFile(join(dataDir, 'state.json')), configBytes = await readFile(configPath);
+  await exec(binary, ['extension', 'disable', 'broker-proxy'], { env });
+  await exec(binary, ['extension', 'remove', 'broker-proxy'], { env });
+  assert.deepEqual(await readFile(join(dataDir, 'state.json')), durable);
+  assert.deepEqual(await readFile(configPath), configBytes);
+  assert.deepEqual(await readFile(join(hostDir, 'secrets.json')), secretBytes);
+  await exec(binary, ['extension', 'install', `https://github.com/NotRllyRn/broker-proxy/tree/${ref}`, '--trust'], { env });
+  await exec(binary, ['extension', 'enable', 'broker-proxy'], { env });
+  await start();
+  assert.equal((await request('/v1/models', scoped)).status, 503, 'disabled account survives reinstall');
+  await stop();
+  const retainedState = await readFile(join(dataDir, 'state.json'));
+  // Explicit legacy config and external state win; no implicit copying/migration by the application.
+  const hostStateDir = dataDir;
+  dataDir = join(dir, 'legacy-data'); await cp(hostStateDir, dataDir, { recursive: true });
+  env.BROKER_CONFIG = join(dir, 'legacy-config.json');
+  await writeFile(env.BROKER_CONFIG, JSON.stringify({ ...JSON.parse(configBytes), dataDir }), { mode: 0o600 });
+  await start();
+  assert.equal((await request('/v1/models', scoped)).status, 503);
+  await assert.rejects(access(join(hostStateDir, 'lock')));
+  await stop();
+  assert.deepEqual(await readFile(configPath), configBytes);
+  assert.deepEqual(await readFile(join(hostStateDir, 'state.json')), retainedState, 'legacy override leaves host state untouched');
+  assert.equal((await stat(hostDir)).mode & 0o7777, 0o700);
+  assert.deepEqual(await readFile(join(hostDir, 'secrets.json')), secretBytes);
+  for (const secret of Object.values(secrets)) assert.ok(!logs.includes(secret));
+  delete env.BROKER_CONFIG;
+  // Installed setup must refuse unsafe/partial files before acquiring application resources.
+  const secretPath = join(hostDir, 'secrets.json'), marker = join(hostDir, '.initializing');
+  for (const scenario of ['unsafe', 'partial']) {
+    if (scenario === 'unsafe') await chmod(secretPath, 0o644);
+    else await writeFile(marker, '', { mode: 0o600 });
+    try {
+      await assert.rejects(exec(binary, ['-listen', '127.0.0.1:0', '-upstream', 'http://127.0.0.1:1'], { env, timeout: 15000 }), e => {
+        assert.match(e.stderr, scenario === 'unsafe' ? /UNSAFE_INIT_FILE/ : /BROKER_INIT_IN_PROGRESS_OR_INCOMPLETE/);
+        assert.equal(e.killed, false);
+        for (const secret of Object.values(secrets)) assert.ok(!(e.stdout + e.stderr).includes(secret));
+        return true;
+      });
+      await assert.rejects(access(join(hostStateDir, 'lock')));
+      assert.deepEqual(await readFile(secretPath), secretBytes);
+      assert.deepEqual(await readFile(configPath), configBytes);
+      assert.deepEqual(await readFile(join(hostStateDir, 'state.json')), retainedState);
+    } finally {
+      if (scenario === 'unsafe') await chmod(secretPath, 0o600); else await rm(marker);
+    }
+  }
+  t.diagnostic(`Verified actual GitHub CLI install at ${ref}; automatic host init/no BROKER_CONFIG, two actual-default boots plus four fixture/legacy boots, removal/reinstall retention and explicit external legacy override; declared trailers rejected, opaque SSE, cancellation, scoped credentials, managed safe-method fallback; manual/background pulses/settings/stats, restart and final process/listener/lock cleanup. Only unrelated header installation uses controlled archive transport; upstream/app-server are synthetic, not live-provider verification.`);
 });
