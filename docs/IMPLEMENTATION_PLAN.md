@@ -150,3 +150,7 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 
 - Add opt-in `allowInsecureHttp: true` for web listeners only; retain secure defaults, exact Host/Origin checks, sessions and CSRF.
 - Test opt-in and default rejection; document cleartext risk. Build/publish, update the requested local test installation, configure explicit LAN origins and restart all three listeners.
+
+## Browser form origin correction
+
+- Chromium reproduction: no-referrer makes form POST Origin null, rejected before password validation. Change to same-origin, retain strict origin/CSRF checks, verify actual browser submission and HTTP regression headers, then update test install.

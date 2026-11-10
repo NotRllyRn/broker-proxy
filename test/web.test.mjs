@@ -31,13 +31,13 @@ test('two real HTTP services: admin auth, CSRF, enrollment ownership, activation
   t.after(async () => { await close(); await broker.close(); await rm(dir, { recursive: true, force: true }); });
   const admin = browser(config.dashboard.origin), publicBrowser = browser(config.enrollment.origin), other = browser(config.enrollment.origin);
   assert.equal((await admin.request('/api/status')).status, 401);
-  const login = await admin.request(); assert.match(login.text, /Sign in/); assert.match(login.headers.get('set-cookie') ?? '', /^$/); // already owns a session
+  const login = await admin.request(); assert.equal(login.headers.get('referrer-policy'), 'same-origin'); assert.match(login.text, /Sign in/); assert.match(login.headers.get('set-cookie') ?? '', /^$/); // already owns a session
   assert.equal((await admin.request('/login', { secret: 'wrong' })).status, 401);
   assert.equal((await admin.request('/login', { secret: 'fixture-admin-secret' }, { Origin: 'https://evil.invalid' })).status, 403);
   assert.equal((await admin.request('/login', { secret: 'fixture-admin-secret', csrf: 'wrong' })).status, 403);
   assert.equal((await admin.request('/login', { secret: 'fixture-admin-secret' })).status, 303);
   await admin.request();
-  const home = await publicBrowser.request(); assert.match(home.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
+  const home = await publicBrowser.request(); assert.equal(home.headers.get('referrer-policy'), 'same-origin'); assert.match(home.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
   assert.equal((await publicBrowser.request('/start', {})).status, 303);
   assert.deepEqual(JSON.parse((await other.request('/status')).text), { state: 'idle' });
   await other.request();

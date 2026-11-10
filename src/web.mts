@@ -46,7 +46,7 @@ class Site {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
-    res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'same-origin'); res.setHeader('X-Content-Type-Options', 'nosniff');
     if (req.headers.host !== new URL(this.listener.origin).host) throw new Fault('INVALID_HOST', 403);
     const url = new URL(req.url ?? '/', this.listener.origin);
     const session = this.session(req, res);
