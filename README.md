@@ -135,3 +135,7 @@ This is a reset-driven subset, **not** Codex Broker's full HELD/RELEASING/IN_CYC
 [Implementation plan and source-policy parity](docs/IMPLEMENTATION_PLAN.md) · [test evidence/status](docs/STATUS.md) · [complete assignment](IMPLEMENTATION_PROMPT.md) · [copied reference attribution](reference/README.md).
 
 The Codex Broker reference was inspected, not copied into the new TypeScript implementation. The existing Go reference remains reference material. No license grant was found in the inspected source checkouts; this project does not invent a license or imply permission to redistribute third-party code. No production accounts were migrated, no production service was changed, and no npm package was published.
+
+### Explicit insecure LAN testing
+
+For trusted test networks only, `allowInsecureHttp: true` in private `config.json` permits HTTP web listeners on non-loopback addresses. Set each listener `host` to `0.0.0.0` and its `origin` to the exact browser URL (for example `http://10.17.11.4:8788` and `http://10.17.11.4:8789`). Restart after changing config. Default remains HTTPS-required outside loopback. Host/Origin checks, authentication and CSRF remain enforced. HTTP exposes passwords, bearer tokens and session cookies to network interception; do not use for untrusted networks. The ProxyKit data listener is configured separately with `-listen`.

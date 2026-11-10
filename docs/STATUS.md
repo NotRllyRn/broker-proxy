@@ -142,3 +142,5 @@ Ordinary installed extensions share trusted process/OS authority. This applicati
 ## Reproducibility and remaining verification
 
 Run the commands in the README. Tests bind loopback, use disposable directories and synthetic credentials. The GitHub system test requires a pushed commit; override its reference deliberately rather than claiming unpublished local edits were installed. The exact installed Codex version and unauthenticated initialization/schema checks are now verified separately. A live-provider acceptance pass still needs an operator-authorized account, provider authorization, refresh/quota/inference evidence and safe handling of secrets. No such account was requested or harvested from existing installations.
+
+- Explicit `allowInsecureHttp: true` permits trusted-LAN HTTP UI testing without disabling authentication or Host/Origin/CSRF checks; insecure network exposure is operator opt-in.

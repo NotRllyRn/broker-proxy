@@ -145,3 +145,8 @@ One configurable bounded sequential polling loop; no overlapping polls or unboun
 - Node cannot mutate host trusted auth or request another transport attempt directly. Keep application-owned authentication truthful; do not fabricate host scope or safe fallback guarantees.
 - Installer has no local-path CLI option. Local tests must distinguish real installer API from real CLI; public GitHub installation requires pushed compiled artifacts.
 - Full production cycle scheduling, webhook notifications, encrypted vault, multi-instance durability and semantic token usage are deferred, not completed features.
+
+## Follow-up: explicit LAN HTTP testing
+
+- Add opt-in `allowInsecureHttp: true` for web listeners only; retain secure defaults, exact Host/Origin checks, sessions and CSRF.
+- Test opt-in and default rejection; document cleartext risk. Build/publish, update the requested local test installation, configure explicit LAN origins and restart all three listeners.

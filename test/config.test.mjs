@@ -25,6 +25,15 @@ test('configuration validates private files, distinct ports, origins, limits and
     [{ codexCommand: null }, /INVALID_TEXT/],
     [{ codexCommand: '' }, /INVALID_TEXT/],
   ]) { await save(value); await assert.rejects(loadConfig(path), error); }
+  const lan = { host: '0.0.0.0', origin: 'http://10.17.11.4:8788' };
+  for (const allowInsecureHttp of [undefined, false, 'true']) {
+    await save({ dashboard: lan, allowInsecureHttp });
+    await assert.rejects(loadConfig(path), /INVALID_ORIGIN/);
+  }
+  await save({ dashboard: lan, allowInsecureHttp: true });
+  assert.equal((await loadConfig(path)).dashboard.origin, lan.origin);
+  await save({ dashboard: { ...lan, origin: 'http://user:password@10.17.11.4:8788' }, allowInsecureHttp: true });
+  await assert.rejects(loadConfig(path), /INVALID_ORIGIN/);
   await save({ enrollment: { host: '0.0.0.0', origin: 'https://enroll.example.invalid' }, pollMs: 0 });
   assert.equal((await loadConfig(path)).enrollment.origin, 'https://enroll.example.invalid');
 });

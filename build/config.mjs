@@ -1,7 +1,7 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { Fault, object, text, labels } from './model.mjs';
-function listener(value, port) {
+function listener(value, port, allowInsecureHttp) {
     const v = value ? object(value) : {};
     const host = typeof v.host === 'string' ? v.host : '127.0.0.1';
     const p = v.port ?? port;
@@ -10,7 +10,7 @@ function listener(value, port) {
     const loopback = ['127.0.0.1', '::1', 'localhost'].includes(host);
     const origin = new URL(typeof v.origin === 'string' ? v.origin : `http://${host.includes(':') ? `[${host}]` : host}:${p}`);
     if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash
-        || !loopback && origin.protocol !== 'https:' || origin.protocol === 'http:' && !['127.0.0.1', '[::1]', 'localhost'].includes(origin.hostname))
+        || !allowInsecureHttp && (!loopback && origin.protocol !== 'https:' || origin.protocol === 'http:' && !['127.0.0.1', '[::1]', 'localhost'].includes(origin.hostname)))
         throw new Fault('INVALID_ORIGIN');
     return { host, port: Number(p), origin: origin.origin };
 }
@@ -50,7 +50,7 @@ export async function loadConfig(path = process.env.BROKER_CONFIG, hostDataDir) 
     const pollMs = v.pollMs ?? 90000;
     if (!Number.isSafeInteger(pollMs) || Number(pollMs) !== 0 && (Number(pollMs) < 45000 || Number(pollMs) > 86400000))
         throw new Fault('INVALID_POLL_INTERVAL');
-    const dashboard = listener(v.dashboard, 8788), enrollment = listener(v.enrollment, 8789);
+    const dashboard = listener(v.dashboard, 8788, v.allowInsecureHttp === true), enrollment = listener(v.enrollment, 8789, v.allowInsecureHttp === true);
     if (dashboard.port === enrollment.port || dashboard.origin === enrollment.origin)
         throw new Fault('SEPARATE_PORTS_REQUIRED');
     return { dataDir, adminHash, upstream: upstream.href.replace(/\/$/, ''), codexCommand: v.codexCommand === undefined ? undefined : text(v.codexCommand, 4096),
